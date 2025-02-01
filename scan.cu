@@ -44,7 +44,7 @@ __global__ void scan(float* out, float* in, int n) {
 }
 
 template <int blockSize>
-__global__ void scan_work_efficient(float* out, float* in, int n) {
+__global__ void scan_work_efficient(float* out, float const* in, int n) {
   auto tid = threadIdx.x;
   auto i = blockIdx.x * blockDim.x + threadIdx.x;
   __shared__ float sh[blockSize];
@@ -118,18 +118,20 @@ auto timeit(std::string const & name, int nrepeat, auto && worker)
   return duration / (double)nrepeat;
 }
 
-void compare(std::string name,
-             thrust::device_vector<int> const& sol,
-             thrust::device_vector<int> const& x,
-             thrust::device_vector<int>& y_test,
+void compare(std::string name, thrust::device_vector<float> const& y_true,
+             thrust::device_vector<float> & y_test,
              auto && worker) {
   thrust::fill(y_test.begin(), y_test.end(), 0);
   worker();
   gpuErrchk( cudaPeekAtLastError() );
   gpuErrchk( cudaDeviceSynchronize() );
-  if (sol != y_test) {
+  if (y_true != y_test) {
     std::cout << "Test " << name <<" failed" << std::endl;
     exit(1);
+  }
+  else {
+    std::cout << "Test " << name << " passed" << std::endl;
+
   }
 }
 
@@ -137,31 +139,37 @@ auto main(int argc, char *argv[]) -> int {
 
   int n = 32;
   thrust::device_vector<float> x(32, 1);
-  thrust::device_vector<float> y(32, 0);
+  thrust::device_vector<float> y_true(32, 0);
+  thrust::device_vector<float> y_test(32, 0);
   constexpr int block_size = 32;
   int n_blocks = (n + block_size - 1) / block_size;
   scan<block_size><<<n_blocks, block_size>>>(
-      thrust::raw_pointer_cast(y.data()),
+      thrust::raw_pointer_cast(y_true.data()),
       thrust::raw_pointer_cast(x.data()), n);
   gpuErrchk( cudaPeekAtLastError() );
   gpuErrchk( cudaDeviceSynchronize() );
 
-  thrust::fill(y.begin(), y.end(), 0);
-  scan_work_efficient<block_size><<<n_blocks, block_size>>>(
-      thrust::raw_pointer_cast(y.data()),
-      thrust::raw_pointer_cast(x.data()), n);
-  gpuErrchk( cudaPeekAtLastError() );
-  gpuErrchk( cudaDeviceSynchronize() );
+  compare("test work efficient", y_true, y_test, [&] {
+      scan_work_efficient<block_size><<<n_blocks, block_size>>>(
+          thrust::raw_pointer_cast(y_test.data()),
+          thrust::raw_pointer_cast(x.data()), x.size());
+    });
+  // thrust::fill(y.begin(), y.end(), 0);
+  // scan_work_efficient<block_size><<<n_blocks, block_size>>>(
+  //     thrust::raw_pointer_cast(y_test.data()),
+  //     thrust::raw_pointer_cast(x.data()), n);
+  // gpuErrchk( cudaPeekAtLastError() );
+  // gpuErrchk( cudaDeviceSynchronize() );
 
-  for (int i = 0; i < n; i++)
-    std::cout << i << "\t";
-  std::cout << std::endl;
-  for (auto val : x)
-    std::cout << val << "\t";
-  std::cout << std::endl;
-  for (auto val : y)
-    std::cout << val << "\t";
-  std::cout << std::endl;
+  // for (int i = 0; i < n; i++)
+  //   std::cout << i << "\t";
+  // std::cout << std::endl;
+  // for (auto val : x)
+  //   std::cout << val << "\t";
+  // std::cout << std::endl;
+  // for (auto val : y)
+  //   std::cout << val << "\t";
+  // std::cout << std::endl;
 
 
   return 0;
