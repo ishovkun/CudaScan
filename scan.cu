@@ -107,7 +107,7 @@ downsweep
 }
 
 template <int blockSize>
-__global__ void scan_work_efficient(float* out, float const* in, int n) {
+__global__ void scan_work_efficient(float* out, float const* in, int n, float* partial_sums) {
   __shared__ float sh[2*blockSize];
 
   auto tid = threadIdx.x;
@@ -132,10 +132,8 @@ __global__ void scan_work_efficient(float* out, float const* in, int n) {
   }
   if (tid == 0) sh[2*blockSize-1] = sh[0]; // last element (le)
   __syncthreads();
-  // NOTE: s limits [1, blockSize]
   for (int s = blockSize; s > 0; s /= 2) {
     auto idx = 2*s*tid + s - 1;
-    // s = 8: 0->7, 1
     if (idx + s < 2*blockSize) {
       auto tmp = sh[idx+s];
       sh[idx+s] += sh[idx];
@@ -149,6 +147,7 @@ __global__ void scan_work_efficient(float* out, float const* in, int n) {
   if (ib < n) {
     out[ib] = sh[tid+blockSize];
   }
+  if (tid == 0) partial_sums[blockIdx.x] = sh[2*blockSize-1];
 }
 
 // constexpr int NUM_BANKS = 32; // unused
@@ -161,7 +160,7 @@ __host__ __device__ constexpr inline int conflict_free_offset(int n) {
 }
 
 template <int blockSize>
-__global__ void scan_conflict_free(float* out, float const* in, int n) {
+__global__ void scan_conflict_free(float* out, float const* in, int n, float* partial_sums) {
   constexpr int shmem_size =  conflict_free_offset(2*blockSize);
   __shared__ float sh[shmem_size];
   auto tid = threadIdx.x;
@@ -203,6 +202,7 @@ __global__ void scan_conflict_free(float* out, float const* in, int n) {
   if (2*i+1 < n) {
     out[2*i+1] = sh[conflict_free_offset(2*tid+1)];
   }
+  if (tid == 0) partial_sums[blockIdx.x] = sh[2*blockSize-1];
 }
 
 auto timeit(std::string const & name, int nrepeat, auto && worker)
@@ -289,31 +289,24 @@ void scan(thrust::device_vector<float> & in,
 auto main(int argc, char *argv[]) -> int {
 
   {
-    int n = 64;
+    constexpr int block_size = 32;
+    int n = 4*block_size;
     thrust::device_vector<float> x(n, 1);
     thrust::device_vector<float> y_true(n, 0);
     thrust::device_vector<float> y_test(n, 0);
-    constexpr int block_size = 32;
-    int n_blocks = (n + block_size - 1) / block_size;
     scan(x, y_true, block_size, block_size, scan_naive<block_size>);
     gpuErrchk(cudaPeekAtLastError());
     gpuErrchk(cudaDeviceSynchronize());
 
+    // void scan(in, out, block_size, tile_size,  scan_kernel) ;
     compare("test more efficient", y_true, y_test, [&] {
         scan(x, y_test, block_size, block_size, scan_more_efficient<block_size>);
-      // scan_more_efficient<block_size><<<n_blocks, block_size>>>(
-      //     thrust::raw_pointer_cast(y_test.data()),
-      //     thrust::raw_pointer_cast(x.data()), x.size());
     });
     compare("test work efficient", y_true, y_test, [&] {
-      scan_work_efficient<block_size><<<n_blocks, block_size>>>(
-          thrust::raw_pointer_cast(y_test.data()),
-          thrust::raw_pointer_cast(x.data()), x.size());
+        scan(x, y_test, block_size, 2*block_size, scan_work_efficient<block_size>);
     });
     compare("test conflict free", y_true, y_test, [&] {
-      scan_conflict_free<block_size><<<n_blocks, block_size>>>(
-          thrust::raw_pointer_cast(y_test.data()),
-          thrust::raw_pointer_cast(x.data()), x.size());
+        scan(x, y_test, block_size, 2*block_size, scan_conflict_free<block_size>);
     });
   }
 
@@ -322,7 +315,7 @@ auto main(int argc, char *argv[]) -> int {
     int n = 1 << 24;
     thrust::device_vector<float> x(n);
     thrust::sequence(x.begin(), x.end());
-    thrust::device_vector<float> y(1 << 24, 0.f);
+    thrust::device_vector<float> y(n, 0.f);
     constexpr int threads_per_block = 256;
     int n_repeat = 1000;
     int n_blocks = (x.size() + threads_per_block - 1) / threads_per_block;
@@ -347,8 +340,10 @@ auto main(int argc, char *argv[]) -> int {
       });
     timeit("scan work efficient", n_repeat, [&] {
         thrust::fill(y.begin(), y.end(), 0.f);
-        scan_work_efficient<threads_per_block><<<n_blocks/2, threads_per_block>>>(thrust::raw_pointer_cast(y.data()),
-                                                                                thrust::raw_pointer_cast(x.data()), n);
+        scan_work_efficient<threads_per_block>
+            <<<n_blocks/2, threads_per_block>>>(thrust::raw_pointer_cast(y.data()),
+                                                thrust::raw_pointer_cast(x.data()), n,
+                                                thrust::raw_pointer_cast(partial_sums.data()));
         gpuErrchk( cudaPeekAtLastError() );
         gpuErrchk( cudaDeviceSynchronize() );
       });
