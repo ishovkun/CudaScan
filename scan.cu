@@ -202,7 +202,7 @@ __global__ void scan_conflict_free(float* out, float const* in, int n, float* pa
   if (2*i+1 < n) {
     out[2*i+1] = sh[conflict_free_offset(2*tid+1)];
   }
-  if (tid == 0) partial_sums[blockIdx.x] = sh[2*blockSize-1];
+  if (tid == 0) partial_sums[blockIdx.x] = sh[conflict_free_offset(2*blockSize-1)];
 }
 
 auto timeit(std::string const & name, int nrepeat, auto && worker)
@@ -270,10 +270,10 @@ void scan(thrust::device_vector<float> & in,
 
     thrust::device_vector<float> partial_sums_of_partial_sums(num_blocks, 0);
     scan(partial_sums, partial_sums_of_partial_sums, block_size, tile_size, scan_kernel);
-    std::cout << "sums of partial sums: ";
-    for (auto x : partial_sums_of_partial_sums)
-      std::cout << x << " ";
-    std::cout << std::endl;
+    // std::cout << "sums of partial sums: ";
+    // for (auto x : partial_sums_of_partial_sums)
+    //   std::cout << x << " ";
+    // std::cout << std::endl;
 
 
 
