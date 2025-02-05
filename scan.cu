@@ -208,7 +208,7 @@ __global__ void scan_conflict_free(float* out, float const* in, int n, float* pa
 }
 
 __device__ constexpr __forceinline__ int swizzle(int i) {
-  return i ^ (i >> 4);
+  return i ^ (i >> 3);
 }
 
 template <int blockSize>
@@ -373,7 +373,7 @@ auto main(int argc, char *argv[]) -> int {
     thrust::sequence(x.begin(), x.end());
     thrust::device_vector<float> y(n, 0.f);
     constexpr int threads_per_block = 256;
-    int n_repeat = 24;
+    int n_repeat = 100;
     int n_blocks = (x.size() + threads_per_block - 1) / threads_per_block;
     std::vector<float> partial_sums(n_blocks, 0);
 
