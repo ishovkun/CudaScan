@@ -215,9 +215,11 @@ auto timeit(std::string const & name, int nrepeat, auto && worker)
     if (nrepeat != 1 && nrepeat < 10)
       std::cout << "Repeat " << i + 1 << "/" << nrepeat << std::endl;
     worker();
+    gpuErrchk( cudaPeekAtLastError() );
+    gpuErrchk( cudaDeviceSynchronize() );
   }
-  gpuErrchk( cudaPeekAtLastError() );
-  gpuErrchk( cudaDeviceSynchronize() );
+  // gpuErrchk( cudaPeekAtLastError() );
+  // gpuErrchk( cudaDeviceSynchronize() );
 
   auto const end_time = high_resolution_clock::now();
   auto const duration = (duration_cast<microseconds>(end_time - start_time)).count();
@@ -320,18 +322,17 @@ auto main(int argc, char *argv[]) -> int {
     thrust::sequence(x.begin(), x.end());
     thrust::device_vector<float> y(n, 0.f);
     constexpr int threads_per_block = 256;
-    // int n_repeat = 1000;
-    int n_repeat = 1;
+    int n_repeat = 24;
     int n_blocks = (x.size() + threads_per_block - 1) / threads_per_block;
     std::vector<float> partial_sums(n_blocks, 0);
 
-    // Warm UP
-    timeit("Warm UP", n_repeat, [&] {
-        scan_work_efficient<threads_per_block>
-            <<<n_blocks/2, threads_per_block>>>(thrust::raw_pointer_cast(y.data()),
-                                                thrust::raw_pointer_cast(x.data()), n,
-                                                thrust::raw_pointer_cast(partial_sums.data()));
-      });
+    // // Warm UP
+    // timeit("Warm UP", n_repeat, [&] {
+    //     scan_work_efficient<threads_per_block>
+    //         <<<n_blocks/2, threads_per_block>>>(thrust::raw_pointer_cast(y.data()),
+    //                                             thrust::raw_pointer_cast(x.data()), n,
+    //                                             thrust::raw_pointer_cast(partial_sums.data()));
+    //   });
 
     thrust::fill(y.begin(), y.end(), 0.f);
     thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
