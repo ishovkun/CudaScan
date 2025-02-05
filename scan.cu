@@ -208,7 +208,7 @@ __global__ void scan_conflict_free(float* out, float const* in, int n, float* pa
 }
 
 __device__ constexpr __forceinline__ int swizzle(int i) {
-  return i ^ (i >> 3);
+  return i ^ (i >> 4);
 }
 
 template <int blockSize>
