@@ -17,9 +17,9 @@ https://people.cs.vt.edu/yongcao/teaching/cs5234/spring2013/slides/Lecture10.pdf
 
 
 # Timings
-The experiment is conducted on a A100 GPU.
-Test 'scan naive' took 204.83 [us] (average)
-Test 'scan more efficient' took 262.94 [us] (average)
-Test 'scan work efficient' took 253.41 [us] (average)
-Test 'scan conflict free' took 162.62 [us] (average)
-Test 'scan conflict free swizzle' took 162.98 [us] (average)
+The experiment is conducted on a A100 GPU.  
+Test 'scan naive' took 204.83 [us] (average)  
+Test 'scan more efficient' took 262.94 [us] (average)  
+Test 'scan work efficient' took 253.41 [us] (average)  
+Test 'scan conflict free' took 162.62 [us] (average)  
+Test 'scan conflict free swizzle' took 162.98 [us] (average)  
