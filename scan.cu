@@ -65,12 +65,16 @@ __global__ void scan_more_efficient(float* out, float const* in, int n, float* p
 
   // upsweep
   /*
-    | idx  | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 1 | 13 | 14 | 15 |
-    | init | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 | 1 |  1 |  1 | 1 |  1 |  1 |  1 |
-    | s=1  | 1 | 2 | 1 | 2 | 1 | 2 | 1 | 2 | 1 | 2 |  1 |  2 | 1 |  2 |  1 |  2 |
-    | s=2  | 1 | 2 | 1 | 4 | 1 | 2 | 1 | 4 | 1 | 2 |  1 |  4 | 1 |  2 |  1 |  4 |
-    | s=4  | 1 | 2 | 1 | 4 | 1 | 2 | 1 | 8 | 1 | 2 |  1 |  4 | 1 |  2 |  1 |  8 |
-    | s=8  | 1 | 2 | 1 | 4 | 1 | 2 | 1 | 8 | 1 | 2 |  1 |  4 | 1 |  2 |  1 | 16 |
+      | idx  | 0 | 1 | 2 |  3 | 4 |  5 | 6 |  7 | 8 |  9 | 10 | 11 | 12 | 13 | 14 |  15 |
+      | init | 1 | 2 | 3 |  4 | 5 |  6 | 7 |  8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 |  16 |
+              \---|   \----|    \--|    \----|   \---|    \-----|    \----|   \-----|
+      | s=1  |   | 3 |   |  7 |   | 11 |   | 15 |   | 19 |    | 23 |    | 27 |    |  31 |
+                  \--------|        \--------|        \---------|        \----------|
+      | s=2  |   |   |   | 10 |   |    |   | 26 |   |    |    | 42 |    |    |    |  58 |
+                            \----------------|                   \-------------------|
+      | s=4  |   |   |   |    |   |    |   | 36 |   |    |    |    |    |    |    | 100 |
+                                              \--------------------------------------|
+      | s=8  |   |   |   |    |   |    |   |    |   |    |    |    |    |    |    | 136 |
   */
   for (int s = 1; s < blockSize; s *= 2) {
     if ((tid+1) % (2*s) == 0) {
@@ -78,34 +82,27 @@ __global__ void scan_more_efficient(float* out, float const* in, int n, float* p
     }
     __syncthreads();
   }
+  if (tid == blockSize - 1) {
+    partial_sums[blockIdx.x] = sh[tid];
+  }
   /*
-downsweep
-  | idx  | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |  9 | 10 | 11 | 12 | 13 | 14 | 15 |
-  | init | 1 | 2 | 1 | 4 | 1 | 2 | 1 | 8 | 1 |  2 |  1 |  4 |  1 |  2 |  1 | 16 |
-         | |------------------------------>>>>>>>>---------------------------\
-  | le   | 1 | 2 | 1 | 4 | 1 | 2 | 1 | 8 | 1 |  2 |  1 |  4 |  1 |  2 |  1 |  1 |
-         |                             |-------------------------------------\
-  | s=8  | 1 | 2 | 1 | 4 | 1 | 2 | 1 | 1 | 1 |  2 |  1 |  4 |  1 |  2 |  1 |  8 |
-         |            |--------------\                   |------------------\
-  | s=4  | 1 | 2 | 1 | 1 | 1 | 2 | 1 | 5 | 1 |  2 |  1 |  8 |  1 |  2 |  1 | 12 |
-         |    |------\        |------\         |--------\          |---------\
-  | s=2  | 1 | 1 | 1 | 3 | 1 | 5 | 1 | 7 | 1 |  8 |  1 | 10 |  1 | 12 |  1 | 14 |
-         ||---\   |---\   |---\   |---\   |----\    |---\     |----\    |----\
-  | s=1  | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 10 | 11 | 12 | 13 | 14 | 15 |
+    downsweep
+    | idx  | 0 | 1 | 2 |  3 |  4 |  5 |  6 | 7  |  8 |  9 | 10 | 11 | 12 | 13 | 14 |  15 |
+    | init | 1 | 3 | 3 | 10 |  5 | 11 |  7 | 36 |  9 | 19 | 11 | 42 | 13 | 27 | 15 | 136 |
+                                            \--------->>--------\
+    | s=4  |   |   |   |    |    |    |    | X  |    |    |    | 78 |    |    |    |     |
+                          \--->>----\       \--->>----\          \--->>---\
+    | s=2  |   |   |   |  X |    | 21 |    | X  |    | 55 |    |  X |    | 69 |    |     |
+                \->-\    \->-\     \->-\    \->-\      \->-\     \->-\     \->-\
+    | s=1  |   | X | 6 |  X | 15 |  X | 28 | X  | 45 |  X | 66 |  X | 91 |  X | 85 |     |
    */
-  if (tid == blockSize - 1) sh[tid] = sh[0]; // last element (le)
-  __syncthreads();
   for (int s = blockSize/2; s > 0; s /= 2) {
     if ((tid+1) % (2*s) == 0) {
-      auto tmp = sh[tid];
-      sh[tid] += sh[tid-s];
-      sh[tid-s] = tmp;
+      sh[tid+s] += sh[tid];
     }
     __syncthreads();
   }
-  if (i < n)
-    out[i] = sh[tid];
-  if (tid == 0) partial_sums[blockIdx.x] = sh[blockSize-1];
+  if (i < n) out[i] = sh[tid];
 }
 
 template <int blockSize>
@@ -126,20 +123,20 @@ __global__ void scan_work_efficient(float* out, float const* in, int n, float* p
   // the s limit: in the previous function it was [1, blockSize/2],
   // now it's [1, blockSize]
   for (int s = 1; s <= blockSize; s *= 2) {
-    auto idx = 2*s*tid + s - 1; // s=1: 0->0, 1->2, 2->4, 3->6; s=2: 0->1
+    auto idx = 2*s*tid + s - 1;
     if (idx+s < 2*blockSize) {
       sh[idx+s] += sh[idx];
     }
     __syncthreads();
   }
-  if (tid == 0) sh[2*blockSize-1] = sh[0]; // last element (le)
-  __syncthreads();
+  if (tid == 0) {
+    partial_sums[blockIdx.x] = sh[2*blockSize-1];
+  }
+  // no need to __syncthreads(); (we don't touch the last element)
   for (int s = blockSize; s > 0; s /= 2) {
-    auto idx = 2*s*tid + s - 1;
+    auto idx = 2*s*(tid+1) - 1;
     if (idx + s < 2*blockSize) {
-      auto tmp = sh[idx+s];
       sh[idx+s] += sh[idx];
-      sh[idx] = tmp;
     }
     __syncthreads();
   }
@@ -149,7 +146,6 @@ __global__ void scan_work_efficient(float* out, float const* in, int n, float* p
   if (ib < n) {
     out[ib] = sh[tid+blockSize];
   }
-  if (tid == 0) partial_sums[blockIdx.x] = sh[2*blockSize-1];
 }
 
 
@@ -182,18 +178,15 @@ __global__ void scan_conflict_free(float* out, float const* in, int n, float* pa
     __syncthreads();
   }
 
-  if (tid == 0) sh[conflict_free_offset(2*blockSize-1)] = sh[conflict_free_offset(0)]; // last element
-  __syncthreads();
+  if (tid == 0) {
+    partial_sums[blockIdx.x] = sh[conflict_free_offset(2*blockSize-1)];
+  }
 
   // downsweep
   for (int s = blockSize; s > 0; s /= 2) {
-    auto idx = 2*s*tid + s - 1;
+    auto idx = 2*s*(tid+1) - 1;
     if (idx + s < 2*blockSize) {
-      auto a = conflict_free_offset(idx+s);
-      auto b = conflict_free_offset(idx);
-      auto tmp = sh[a];
-      sh[a] += sh[b];
-      sh[b] = tmp;
+      sh[conflict_free_offset(idx+s)] += sh[conflict_free_offset(idx)];
     }
     __syncthreads();
   }
@@ -204,11 +197,10 @@ __global__ void scan_conflict_free(float* out, float const* in, int n, float* pa
   if (2*i+1 < n) {
     out[2*i+1] = sh[b_base];
   }
-  if (tid == 0) partial_sums[blockIdx.x] = sh[conflict_free_offset(2*blockSize-1)];
 }
 
 __device__ constexpr __forceinline__ int swizzle(int i) {
-  return i ^ (i >> 4);
+  return i ^ (i >> 5);
 }
 
 template <int blockSize>
@@ -234,18 +226,15 @@ __global__ void scan_conflict_free_swizzle(float* out, float const* in, int n, f
     __syncthreads();
   }
 
-  if (tid == 0) sh[swizzle(2*blockSize-1)] = sh[swizzle(0)]; // last element
-  __syncthreads();
+  if (tid == 0) {
+    partial_sums[blockIdx.x] = sh[swizzle(2*blockSize-1)];
+  }
 
   // downsweep
   for (int s = blockSize; s > 0; s /= 2) {
-    auto idx = 2*s*tid + s - 1;
+    auto idx = 2*s*(tid+1) - 1;
     if (idx + s < 2*blockSize) {
-      auto a = swizzle(idx+s);
-      auto b = swizzle(idx);
-      auto tmp = sh[a];
-      sh[a] += sh[b];
-      sh[b] = tmp;
+      sh[swizzle(idx+s)] += sh[swizzle(idx)];
     }
     __syncthreads();
   }
@@ -256,7 +245,6 @@ __global__ void scan_conflict_free_swizzle(float* out, float const* in, int n, f
   if (2*i+1 < n) {
     out[2*i+1] = sh[b_base];
   }
-  if (tid == 0) partial_sums[blockIdx.x] = sh[swizzle(2*blockSize-1)];
 }
 
 
@@ -343,15 +331,17 @@ auto main(int argc, char *argv[]) -> int {
 
   {
     constexpr int block_size = 32;
-    int n = 4*block_size;
+    int n = 5*block_size;
     thrust::device_vector<float> x(n, 1);
+    thrust::sequence(x.begin(), x.end(), 1);
     thrust::device_vector<float> y_true(n, 0);
     thrust::device_vector<float> y_test(n, 0);
-    scan(x, y_true, block_size, block_size, scan_naive<block_size>);
-    gpuErrchk(cudaPeekAtLastError());
-    gpuErrchk(cudaDeviceSynchronize());
+    thrust::inclusive_scan(x.begin(), x.end(), y_true.begin());
 
     // void scan(in, out, block_size, tile_size,  scan_kernel) ;
+    compare("test naive", y_true, y_test, [&] {
+        scan(x, y_test, block_size, block_size, scan_naive<block_size>);
+    });
     compare("test more efficient", y_true, y_test, [&] {
         scan(x, y_test, block_size, block_size, scan_more_efficient<block_size>);
     });
