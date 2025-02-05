@@ -4,6 +4,8 @@
 #include <thrust/device_vector.h>
 #include <chrono>
 
+constexpr int LOG_NUM_BANKS = 5; // NUM_BANKS = 32; // unused
+
 #define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 static inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true) {
   if (code != cudaSuccess)
@@ -150,8 +152,6 @@ __global__ void scan_work_efficient(float* out, float const* in, int n, float* p
   if (tid == 0) partial_sums[blockIdx.x] = sh[2*blockSize-1];
 }
 
-constexpr int LOG_NUM_BANKS = 5; // NUM_BANKS = 32; // unused
-// #define CONFLICT_FREE_OFFSET(index) (((index) >> LOG_NUM_BANKS) + ((index) >> (2 * LOG_NUM_BANKS)))
 
 __host__ __device__ constexpr __forceinline__ int conflict_free_offset(int n) {
   return n + (n >> LOG_NUM_BANKS) + (n >> (2*LOG_NUM_BANKS));
@@ -419,29 +419,6 @@ auto main(int argc, char *argv[]) -> int {
                                                 thrust::raw_pointer_cast(partial_sums.data()));
       });
   }
-
-
-  // for (int idx : {0, 1, 10, 16, 32, 35, 36, 64, 70, 144, 250}) {
-  //   std::cout << "conflict_free(" << idx << ") = " << conflict_free_offset(idx) << std::endl;
-  // }
-
-  // thrust::fill(y.begin(), y.end(), 0);
-  // scan_work_efficient<block_size><<<n_blocks, block_size>>>(
-  //     thrust::raw_pointer_cast(y_test.data()),
-  //     thrust::raw_pointer_cast(x.data()), n);
-  // gpuErrchk( cudaPeekAtLastError() );
-  // gpuErrchk( cudaDeviceSynchronize() );
-
-  // for (int i = 0; i < n; i++)
-  //   std::cout << i << "\t";
-  // std::cout << std::endl;
-  // for (auto val : x)
-  //   std::cout << val << "\t";
-  // std::cout << std::endl;
-  // for (auto val : y)
-  //   std::cout << val << "\t";
-  // std::cout << std::endl;
-
 
   return 0;
 }
