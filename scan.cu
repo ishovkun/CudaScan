@@ -408,6 +408,13 @@ auto main(int argc, char *argv[]) -> int {
                                                 thrust::raw_pointer_cast(x.data()), n,
                                                 thrust::raw_pointer_cast(partial_sums.data()));
       });
+    // this is not a fair comparison since thrust will do the full scan
+    // as opposed to a single step
+    // thrust::fill(y.begin(), y.end(), 0.f);
+    // thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
+    // timeit("thrust", n_repeat, [&] {
+    //     thrust::inclusive_scan(x.begin(), x.end(), y.begin());
+    //   });
   }
 
   return 0;
