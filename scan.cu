@@ -151,7 +151,7 @@ __global__ void scan_work_efficient(float* out, float const* in, int n, float* p
 }
 
 constexpr int LOG_NUM_BANKS = 5; // NUM_BANKS = 32; // unused
-#define CONFLICT_FREE_OFFSET(index) (((index) >> LOG_NUM_BANKS) + ((index) >> (2 * LOG_NUM_BANKS)))
+// #define CONFLICT_FREE_OFFSET(index) (((index) >> LOG_NUM_BANKS) + ((index) >> (2 * LOG_NUM_BANKS)))
 
 __host__ __device__ constexpr __forceinline__ int conflict_free_offset(int n) {
   return n + (n >> LOG_NUM_BANKS) + (n >> (2*LOG_NUM_BANKS));
@@ -197,6 +197,7 @@ __global__ void scan_conflict_free(float* out, float const* in, int n, float* pa
     }
     __syncthreads();
   }
+  // write results
   if (2*i < n) {
     out[2*i] = sh[a_base];
   }
@@ -205,6 +206,59 @@ __global__ void scan_conflict_free(float* out, float const* in, int n, float* pa
   }
   if (tid == 0) partial_sums[blockIdx.x] = sh[conflict_free_offset(2*blockSize-1)];
 }
+
+__device__ constexpr __forceinline__ int swizzle(int i) {
+  return i ^ (i >> 4);
+}
+
+template <int blockSize>
+__global__ void scan_conflict_free_swizzle(float* out, float const* in, int n, float* partial_sums) {
+  __shared__ float sh[2*blockSize];
+  auto tid = threadIdx.x;
+  auto i = blockIdx.x * blockDim.x + threadIdx.x;
+
+  auto a_base = swizzle(2*tid);
+  auto b_base = swizzle(2*tid+1);
+  if (2*i < n) sh[a_base] = in[2*i];
+  else sh[a_base] = 0;
+  if (2*i+1 < n) sh[b_base] = in[2*i+1];
+  else sh[b_base] = 0;
+  __syncthreads();
+
+  // upsweep
+  for (int s = 1; s <= blockSize; s *= 2) {
+    auto idx = 2*s*tid + s - 1;
+    if (idx+s < 2*blockSize) {
+      sh[swizzle(idx+s)] += sh[swizzle(idx)];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) sh[swizzle(2*blockSize-1)] = sh[swizzle(0)]; // last element
+  __syncthreads();
+
+  // downsweep
+  for (int s = blockSize; s > 0; s /= 2) {
+    auto idx = 2*s*tid + s - 1;
+    if (idx + s < 2*blockSize) {
+      auto a = swizzle(idx+s);
+      auto b = swizzle(idx);
+      auto tmp = sh[a];
+      sh[a] += sh[b];
+      sh[b] = tmp;
+    }
+    __syncthreads();
+  }
+  // write results
+  if (2*i < n) {
+    out[2*i] = sh[a_base];
+  }
+  if (2*i+1 < n) {
+    out[2*i+1] = sh[b_base];
+  }
+  if (tid == 0) partial_sums[blockIdx.x] = sh[swizzle(2*blockSize-1)];
+}
+
 
 auto timeit(std::string const & name, int nrepeat, auto && worker)
 {
@@ -275,12 +329,6 @@ void scan(thrust::device_vector<float> & in,
 
     thrust::device_vector<float> partial_sums_of_partial_sums(num_blocks, 0);
     scan(partial_sums, partial_sums_of_partial_sums, block_size, tile_size, scan_kernel);
-    // std::cout << "sums of partial sums: ";
-    // for (auto x : partial_sums_of_partial_sums)
-    //   std::cout << x << " ";
-    // std::cout << std::endl;
-
-
 
     add_partial_sums<<<num_blocks, tile_size>>>(thrust::raw_pointer_cast(out.data()),
                                                 thrust::raw_pointer_cast(partial_sums_of_partial_sums.data()),
@@ -313,6 +361,9 @@ auto main(int argc, char *argv[]) -> int {
     compare("test conflict free", y_true, y_test, [&] {
         scan(x, y_test, block_size, 2*block_size, scan_conflict_free<block_size>);
     });
+    compare("test conflict free swizzle", y_true, y_test, [&] {
+        scan(x, y_test, block_size, 2*block_size, scan_conflict_free_swizzle<block_size>);
+    });
   }
 
   // benchmarks
@@ -325,14 +376,6 @@ auto main(int argc, char *argv[]) -> int {
     int n_repeat = 24;
     int n_blocks = (x.size() + threads_per_block - 1) / threads_per_block;
     std::vector<float> partial_sums(n_blocks, 0);
-
-    // // Warm UP
-    // timeit("Warm UP", n_repeat, [&] {
-    //     scan_work_efficient<threads_per_block>
-    //         <<<n_blocks/2, threads_per_block>>>(thrust::raw_pointer_cast(y.data()),
-    //                                             thrust::raw_pointer_cast(x.data()), n,
-    //                                             thrust::raw_pointer_cast(partial_sums.data()));
-    //   });
 
     thrust::fill(y.begin(), y.end(), 0.f);
     thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
@@ -363,6 +406,14 @@ auto main(int argc, char *argv[]) -> int {
     thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
     timeit("scan conflict free", n_repeat, [&] {
         scan_conflict_free<threads_per_block>
+            <<<n_blocks/2, threads_per_block>>>(thrust::raw_pointer_cast(y.data()),
+                                                thrust::raw_pointer_cast(x.data()), n,
+                                                thrust::raw_pointer_cast(partial_sums.data()));
+      });
+    thrust::fill(y.begin(), y.end(), 0.f);
+    thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
+    timeit("scan conflict free swizzle", n_repeat, [&] {
+        scan_conflict_free_swizzle<threads_per_block>
             <<<n_blocks/2, threads_per_block>>>(thrust::raw_pointer_cast(y.data()),
                                                 thrust::raw_pointer_cast(x.data()), n,
                                                 thrust::raw_pointer_cast(partial_sums.data()));
