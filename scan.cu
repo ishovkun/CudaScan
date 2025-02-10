@@ -5,6 +5,9 @@
 #include <chrono>
 
 constexpr int LOG_NUM_BANKS = 5; // NUM_BANKS = 32; // unused
+constexpr int WARP_SIZE = 32;
+constexpr unsigned MASK_ALL = 0xffff'ffffu;
+
 
 #define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 static inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true) {
@@ -148,6 +151,54 @@ __global__ void scan_work_efficient(float* out, float const* in, int n, float* p
   }
 }
 
+static __device__ float warp_scan(float value) {
+  const auto lane = threadIdx.x % WARP_SIZE;
+  for (auto s = 1; s < WARP_SIZE; s *= 2) {
+    auto const tmp = __shfl_up_sync(MASK_ALL, value, s);
+    if (lane >= s)
+      value += tmp;
+  }
+  return value;
+}
+
+template <int blockSize>
+__global__ void scan_on_registers(float* out, float const* in, int n, float* partial_sums) {
+  // extra element to avoid ifs for thread 0
+  constexpr int shmem_size = 1 + blockSize/WARP_SIZE;
+  __shared__ float warp_sums[shmem_size];
+  // fill shared sums with zero
+  // we should really only set warp_sums[0] = 0
+  auto tid = threadIdx.x;
+  if (tid < shmem_size)
+    warp_sums[tid] = 0.f;
+
+  auto i = blockIdx.x*blockDim.x + threadIdx.x;
+  auto thread_value = (i < n) ? in[i] : 0;
+
+  auto thread_prefix_within_warp = warp_scan(thread_value);
+  __syncthreads();
+
+  auto warp = threadIdx.x / WARP_SIZE;
+  auto lane = threadIdx.x & (WARP_SIZE-1);
+  if (lane == WARP_SIZE-1)
+    warp_sums[1+warp] = thread_prefix_within_warp;
+  __syncthreads();
+
+  // scan warp sums in a separate warp
+  // max block size = 1024; 1024/32 = 32 -> should fit inside a warp
+  if (warp == 0)
+    warp_sums[1+lane] = warp_scan(warp_sums[1+lane]);
+  __syncthreads();
+
+  if (i < n) {
+    out[i] = thread_prefix_within_warp + warp_sums[warp];
+  }
+  if (tid == 0) {
+    partial_sums[blockIdx.x] = warp_sums[shmem_size - 1];
+  }
+}
+
+
 
 __host__ __device__ constexpr __forceinline__ int conflict_free_offset(int n) {
   return n + (n >> LOG_NUM_BANKS) + (n >> (2*LOG_NUM_BANKS));
@@ -247,7 +298,6 @@ __global__ void scan_conflict_free_swizzle(float* out, float const* in, int n, f
   }
 }
 
-
 auto timeit(std::string const & name, int nrepeat, auto && worker)
 {
   using namespace std::chrono;
@@ -324,13 +374,12 @@ void scan(thrust::device_vector<float> & in,
     gpuErrchk(cudaPeekAtLastError());
     gpuErrchk(cudaDeviceSynchronize());
   }
-
 }
 
 auto main(int argc, char *argv[]) -> int {
 
   {
-    constexpr int block_size = 32;
+    constexpr int block_size = 256;
     int n = 5*block_size;
     thrust::device_vector<float> x(n, 1);
     thrust::sequence(x.begin(), x.end(), 1);
@@ -353,6 +402,9 @@ auto main(int argc, char *argv[]) -> int {
     });
     compare("test conflict free swizzle", y_true, y_test, [&] {
         scan(x, y_test, block_size, 2*block_size, scan_conflict_free_swizzle<block_size>);
+    });
+    compare("test scan on registers", y_true, y_test, [&] {
+        scan(x, y_test, block_size, block_size, scan_on_registers<block_size>);
     });
   }
 
@@ -408,13 +460,29 @@ auto main(int argc, char *argv[]) -> int {
                                                 thrust::raw_pointer_cast(x.data()), n,
                                                 thrust::raw_pointer_cast(partial_sums.data()));
       });
+    thrust::fill(y.begin(), y.end(), 0.f);
+    thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
+    timeit("scan on registers", n_repeat, [&] {
+        scan_on_registers<threads_per_block>
+            <<<n_blocks, threads_per_block>>>(thrust::raw_pointer_cast(y.data()),
+                                              thrust::raw_pointer_cast(x.data()), n,
+                                              thrust::raw_pointer_cast(partial_sums.data()));
+      });
+
+    std::cout << "--- Full function passes ----" << std::endl;
     // this is not a fair comparison since thrust will do the full scan
     // as opposed to a single step
-    // thrust::fill(y.begin(), y.end(), 0.f);
-    // thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
-    // timeit("thrust", n_repeat, [&] {
-    //     thrust::inclusive_scan(x.begin(), x.end(), y.begin());
-    //   });
+    thrust::fill(y.begin(), y.end(), 0.f);
+    thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
+    timeit("thrust", n_repeat, [&] {
+        thrust::inclusive_scan(x.begin(), x.end(), y.begin());
+      });
+    thrust::fill(y.begin(), y.end(), 0.f);
+    thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
+    timeit("swizzle scan", n_repeat, [&] {
+        scan(x, y, threads_per_block, 2*threads_per_block, scan_conflict_free_swizzle<threads_per_block>);
+      });
+
   }
 
   return 0;
