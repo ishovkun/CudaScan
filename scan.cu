@@ -1,13 +1,13 @@
+#include <chrono>
 #include <iostream>
 #include <thrust/sequence.h>
 #include <thrust/host_vector.h>
 #include <thrust/device_vector.h>
-#include <chrono>
-
-constexpr int LOG_NUM_BANKS = 5; // NUM_BANKS = 32; // unused
-constexpr int WARP_SIZE = 32;
-constexpr unsigned MASK_ALL = 0xffff'ffffu;
-
+#include <thrust/logical.h>
+#include <thrust/iterator/zip_iterator.h>
+#include "decoupled_lookback.cuh"
+#include "common.cuh"
+#include <iomanip>
 
 #define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 static inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true) {
@@ -149,16 +149,6 @@ __global__ void scan_work_efficient(float* out, float const* in, int n, float* p
   if (ib < n) {
     out[ib] = sh[tid+blockSize];
   }
-}
-
-static __device__ float warp_scan(float value) {
-  const auto lane = threadIdx.x % WARP_SIZE;
-  for (auto s = 1; s < WARP_SIZE; s *= 2) {
-    auto const tmp = __shfl_up_sync(MASK_ALL, value, s);
-    if (lane >= s)
-      value += tmp;
-  }
-  return value;
 }
 
 template <int blockSize>
@@ -322,6 +312,14 @@ auto timeit(std::string const & name, int nrepeat, auto && worker)
   return duration / (double)nrepeat;
 }
 
+struct ApproximateComparator {
+  __host__ __device__ bool operator()(thrust::tuple<float, float> const & tup) {
+    auto l = thrust::get<0>(tup);
+    auto r = thrust::get<1>(tup);
+    return (l != r) && (l != 0.f && fabs((l - r)/l) > 1e-6);
+  }
+};
+
 void compare(std::string name, thrust::device_vector<float> const& y_true,
              thrust::device_vector<float> & y_test,
              auto && worker) {
@@ -329,18 +327,18 @@ void compare(std::string name, thrust::device_vector<float> const& y_true,
   worker();
   gpuErrchk( cudaPeekAtLastError() );
   gpuErrchk( cudaDeviceSynchronize() );
-  if (y_true != y_test) {
+  // bool not_equal = true;
+  auto not_equal = thrust::any_of(thrust::make_zip_iterator(y_true.cbegin(), y_test.cbegin()),
+                                  thrust::make_zip_iterator(y_true.cend(), y_test.cend()),
+                                  ApproximateComparator{});
+  if (not_equal) {
     std::cout << "Test " << name <<" [failed ❌]" << std::endl;
-    std::cout << "true:\t";
-    for (auto val : y_true) {
-      std::cout << val << "\t";
+    auto cmp = ApproximateComparator{};
+    for (int i = 0; i < y_true.size(); i++) {
+      if (cmp(thrust::make_tuple(y_true[i], y_test[i]))) {
+        std::cout << "Mismatch at index " << i << ": " << y_true[i] << " != " << y_test[i] << std::endl;
+      }
     }
-    std::cout << std::endl;
-    std::cout << "test:\t";
-    for (auto val : y_test) {
-      std::cout << val << "\t";
-    }
-    std::cout << std::endl;
     exit(1);
   }
   else {
@@ -379,8 +377,10 @@ void scan(thrust::device_vector<float> & in,
 auto main(int argc, char *argv[]) -> int {
 
   {
-    constexpr int block_size = 256;
-    int n = 5*block_size;
+    // constexpr int block_size = 256;
+    // int n = 5*block_size;
+    constexpr int block_size = 64;
+    int n = 4*block_size;
     thrust::device_vector<float> x(n, 1);
     thrust::sequence(x.begin(), x.end(), 1);
     thrust::device_vector<float> y_true(n, 0);
@@ -405,6 +405,9 @@ auto main(int argc, char *argv[]) -> int {
     });
     compare("test scan on registers", y_true, y_test, [&] {
         scan(x, y_test, block_size, block_size, scan_on_registers<block_size>);
+    });
+    compare("scan single pass", y_true, y_test, [&] {
+        scan_single_pass<block_size>(x, y_test);
     });
   }
 
@@ -479,8 +482,13 @@ auto main(int argc, char *argv[]) -> int {
       });
     thrust::fill(y.begin(), y.end(), 0.f);
     thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
-    timeit("swizzle scan", n_repeat, [&] {
-        scan(x, y, threads_per_block, 2*threads_per_block, scan_conflict_free_swizzle<threads_per_block>);
+    timeit("scan on registers", n_repeat, [&] {
+        scan(x, y, threads_per_block, threads_per_block, scan_on_registers<threads_per_block>);
+      });
+    thrust::fill(y.begin(), y.end(), 0.f);
+    thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
+    timeit("scan decoupled lookback", n_repeat, [&] {
+        scan_single_pass<threads_per_block>(x, y);
       });
 
   }

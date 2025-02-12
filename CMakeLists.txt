@@ -15,3 +15,10 @@ set_target_properties(scan PROPERTIES
   LINKER_LANGUAGE CXX
 )
 target_include_directories(scan PRIVATE Thrust::Thrust ${CUDA_INCLUDE_DIRS})
+target_compile_options(scan PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --generate-line-info
+                              --use_fast_math
+                              --expt-extended-lambda
+                              -std=c++20
+                              >
+)
