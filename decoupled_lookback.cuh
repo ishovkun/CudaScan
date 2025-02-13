@@ -124,6 +124,7 @@ __device__ void warp_lookback(uint32_t chunk, ScanState* states,
       if (lane >= s) {
         if (tmp.status == TileStatus::unavailable) {
           prev_state.status = tmp.status;
+          prev_state.sum = 0;
         }
         else if (prev_state.status == TileStatus::local_prefix_available) {
           prev_state.sum += tmp.sum;
@@ -132,18 +133,60 @@ __device__ void warp_lookback(uint32_t chunk, ScanState* states,
       }
     }
 
+    auto old_sum = synced_state.sum;
     synced_state = shfl_sync_status(prev_state, last_lane);
+    synced_state.sum += old_sum;
+    if (synced_state.status == TileStatus::local_prefix_available)
+      prev_chunk -= WARP_SIZE;
     iter++;
   }
 
 
   if (lane == last_lane) {
     *sh_prefix_sum = synced_state.sum;
-    if (chunk == gridDim.x - 1) {
-      printf("Num iter = %d\n", iter);
-    }
+    // if (chunk == gridDim.x - 1) {
+    //   printf("Num iter = %d\n", iter);
+    // }
   }
 }
+// __device__ void warp_lookback(uint32_t chunk, ScanState* states,
+//                               volatile float* sh_prefix_sum)
+// {
+//   ScanState synced_state{TileStatus::unavailable, 0.f};
+//   auto const lane = threadIdx.x;
+//   int prev_chunk = chunk - (WARP_SIZE - lane);
+//   constexpr int last_lane = WARP_SIZE - 1;
+//   int iter{0};
+//   while (synced_state.status != TileStatus::global_prefix_available) {
+//     ScanState prev_state = (prev_chunk >= 0) ?
+//                             load_status(&states[prev_chunk]) :
+//                             ScanState{TileStatus::global_prefix_available, 0.f};
+
+//     for (auto s = 1; s < WARP_SIZE; s *= 2) {
+//       auto const tmp = shfl_up_sync_status(prev_state, s);
+//       if (lane >= s) {
+//         if (tmp.status == TileStatus::unavailable) {
+//           prev_state.status = tmp.status;
+//         }
+//         else if (prev_state.status == TileStatus::local_prefix_available) {
+//           prev_state.sum += tmp.sum;
+//           prev_state.status = tmp.status;
+//         }
+//       }
+//     }
+
+//     synced_state = shfl_sync_status(prev_state, last_lane);
+//     iter++;
+//   }
+
+
+//   if (lane == last_lane) {
+//     *sh_prefix_sum = synced_state.sum;
+//     if (chunk == gridDim.x - 1) {
+//       printf("Num iter = %d\n", iter);
+//     }
+//   }
+// }
 
 template <int blockSize>
 __global__ void scan_decoupled_lookback(float* out, float const* in, int n,

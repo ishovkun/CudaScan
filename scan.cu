@@ -379,10 +379,10 @@ void scan(thrust::device_vector<float> & in,
 auto main(int argc, char *argv[]) -> int {
 
   {
-    // constexpr int block_size = 256;
-    // int n = 5*block_size;
-    constexpr int block_size = 32;
-    int n = 2*block_size;
+    constexpr int block_size = 256;
+    int n = 5*block_size;
+    // constexpr int block_size = 32;
+    // int n = 2*block_size;
     thrust::device_vector<float> x(n, 1);
     thrust::sequence(x.begin(), x.end(), 1);
     thrust::device_vector<float> y_true(n, 0);
