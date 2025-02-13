@@ -334,9 +334,11 @@ void compare(std::string name, thrust::device_vector<float> const& y_true,
   if (not_equal) {
     std::cout << "Test " << name <<" [failed ❌]" << std::endl;
     auto cmp = ApproximateComparator{};
-    for (int i = 0; i < y_true.size(); i++) {
+    int n_misses{0};
+    for (int i = 0; i < y_true.size() && n_misses < 10; i++) {
       if (cmp(thrust::make_tuple(y_true[i], y_test[i]))) {
         std::cout << "Mismatch at index " << i << ": " << y_true[i] << " != " << y_test[i] << std::endl;
+        n_misses++;
       }
     }
     exit(1);
@@ -379,8 +381,8 @@ auto main(int argc, char *argv[]) -> int {
   {
     // constexpr int block_size = 256;
     // int n = 5*block_size;
-    constexpr int block_size = 64;
-    int n = 4*block_size;
+    constexpr int block_size = 32;
+    int n = 2*block_size;
     thrust::device_vector<float> x(n, 1);
     thrust::sequence(x.begin(), x.end(), 1);
     thrust::device_vector<float> y_true(n, 0);
@@ -407,7 +409,10 @@ auto main(int argc, char *argv[]) -> int {
         scan(x, y_test, block_size, block_size, scan_on_registers<block_size>);
     });
     compare("scan single pass", y_true, y_test, [&] {
-        scan_single_pass<block_size>(x, y_test);
+        scan_single_pass(x, y_test, block_size, scan_decoupled_lookback<block_size>);
+    });
+    compare("scan parallel lookback", y_true, y_test, [&] {
+        scan_single_pass(x, y_test, block_size, scan_parallel_lookback<block_size>);
     });
   }
 
@@ -419,6 +424,7 @@ auto main(int argc, char *argv[]) -> int {
     thrust::device_vector<float> y(n, 0.f);
     constexpr int threads_per_block = 256;
     int n_repeat = 100;
+    // int n_repeat = 1;
     int n_blocks = (x.size() + threads_per_block - 1) / threads_per_block;
     std::vector<float> partial_sums(n_blocks, 0);
 
@@ -475,20 +481,17 @@ auto main(int argc, char *argv[]) -> int {
     std::cout << "--- Full function passes ----" << std::endl;
     // this is not a fair comparison since thrust will do the full scan
     // as opposed to a single step
-    thrust::fill(y.begin(), y.end(), 0.f);
-    thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
     timeit("thrust", n_repeat, [&] {
         thrust::inclusive_scan(x.begin(), x.end(), y.begin());
       });
-    thrust::fill(y.begin(), y.end(), 0.f);
-    thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
     timeit("scan on registers", n_repeat, [&] {
         scan(x, y, threads_per_block, threads_per_block, scan_on_registers<threads_per_block>);
       });
-    thrust::fill(y.begin(), y.end(), 0.f);
-    thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
     timeit("scan decoupled lookback", n_repeat, [&] {
-        scan_single_pass<threads_per_block>(x, y);
+        scan_single_pass(x, y, threads_per_block, scan_decoupled_lookback<threads_per_block>);
+      });
+    timeit("scan parallel lookback", n_repeat, [&] {
+        scan_single_pass(x, y, threads_per_block, scan_parallel_lookback<threads_per_block>);
       });
 
   }
