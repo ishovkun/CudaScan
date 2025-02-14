@@ -291,7 +291,7 @@ __global__ void scan_conflict_free_swizzle(float* out, float const* in, int n, f
 auto timeit(std::string const & name, int nrepeat, auto && worker)
 {
   using namespace std::chrono;
-  std::cout << "Running \'" << name << "\'" << std::endl;
+  // std::cout << "Running \'" << name << "\'" << std::endl;
   auto const start_time = high_resolution_clock::now();
   for (int i = 0; i < nrepeat; ++i) {
     if (nrepeat != 1 && nrepeat < 10)
@@ -378,6 +378,7 @@ void scan(thrust::device_vector<float> & in,
 
 auto main(int argc, char *argv[]) -> int {
 
+  if (argc == 1)
   {
     constexpr int block_size = 256;
     int n = 5*block_size;
@@ -409,10 +410,13 @@ auto main(int argc, char *argv[]) -> int {
         scan(x, y_test, block_size, block_size, scan_on_registers<block_size>);
     });
     compare("scan single pass", y_true, y_test, [&] {
-        scan_single_pass(x, y_test, block_size, scan_decoupled_lookback<block_size>);
+        scan_single_pass(x, y_test, block_size, scan_serial_lookback<block_size>);
     });
-    compare("scan parallel lookback", y_true, y_test, [&] {
-        scan_single_pass(x, y_test, block_size, scan_parallel_lookback<block_size>);
+    compare("scan warp lookback", y_true, y_test, [&] {
+        scan_single_pass(x, y_test, block_size, scan_warp_lookback<block_size>);
+    });
+    compare("scan block lookback", y_true, y_test, [&] {
+        scan_single_pass(x, y_test, block_size, scan_block_lookback<block_size>);
     });
   }
 
@@ -422,61 +426,64 @@ auto main(int argc, char *argv[]) -> int {
     thrust::device_vector<float> x(n);
     thrust::sequence(x.begin(), x.end());
     thrust::device_vector<float> y(n, 0.f);
-    constexpr int threads_per_block = 256;
+    // constexpr int threads_per_block = 256;
+    constexpr int threads_per_block = 512;
     int n_repeat = 100;
-    // int n_repeat = 1;
-    int n_blocks = (x.size() + threads_per_block - 1) / threads_per_block;
-    std::vector<float> partial_sums(n_blocks, 0);
+    if (argc == 2) {
+      n_repeat = std::stoi(argv[1]);
+    }
+    // int n_blocks = (x.size() + threads_per_block - 1) / threads_per_block;
+    // std::vector<float> partial_sums(n_blocks, 0);
 
-    thrust::fill(y.begin(), y.end(), 0.f);
-    thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
-    timeit("scan naive", n_repeat, [&] {
-        scan_naive<threads_per_block><<<n_blocks, threads_per_block>>>
-            (thrust::raw_pointer_cast(y.data()),
-             thrust::raw_pointer_cast(x.data()), n,
-             thrust::raw_pointer_cast(partial_sums.data()));
-      });
-    thrust::fill(y.begin(), y.end(), 0.f);
-    thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
-    timeit("scan more efficient", n_repeat, [&] {
-        // thrust::fill(y.begin(), y.end(), 0.f);
-        scan_more_efficient<threads_per_block><<<n_blocks, threads_per_block>>>
-            (thrust::raw_pointer_cast(y.data()),
-             thrust::raw_pointer_cast(x.data()), n,
-             thrust::raw_pointer_cast(partial_sums.data()));
-      });
-    thrust::fill(y.begin(), y.end(), 0.f);
-    thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
-    timeit("scan work efficient", n_repeat, [&] {
-        scan_work_efficient<threads_per_block>
-            <<<n_blocks/2, threads_per_block>>>(thrust::raw_pointer_cast(y.data()),
-                                                thrust::raw_pointer_cast(x.data()), n,
-                                                thrust::raw_pointer_cast(partial_sums.data()));
-      });
-    thrust::fill(y.begin(), y.end(), 0.f);
-    thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
-    timeit("scan conflict free", n_repeat, [&] {
-        scan_conflict_free<threads_per_block>
-            <<<n_blocks/2, threads_per_block>>>(thrust::raw_pointer_cast(y.data()),
-                                                thrust::raw_pointer_cast(x.data()), n,
-                                                thrust::raw_pointer_cast(partial_sums.data()));
-      });
-    thrust::fill(y.begin(), y.end(), 0.f);
-    thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
-    timeit("scan conflict free swizzle", n_repeat, [&] {
-        scan_conflict_free_swizzle<threads_per_block>
-            <<<n_blocks/2, threads_per_block>>>(thrust::raw_pointer_cast(y.data()),
-                                                thrust::raw_pointer_cast(x.data()), n,
-                                                thrust::raw_pointer_cast(partial_sums.data()));
-      });
-    thrust::fill(y.begin(), y.end(), 0.f);
-    thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
-    timeit("scan on registers", n_repeat, [&] {
-        scan_on_registers<threads_per_block>
-            <<<n_blocks, threads_per_block>>>(thrust::raw_pointer_cast(y.data()),
-                                              thrust::raw_pointer_cast(x.data()), n,
-                                              thrust::raw_pointer_cast(partial_sums.data()));
-      });
+    // thrust::fill(y.begin(), y.end(), 0.f);
+    // thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
+    // timeit("scan naive", n_repeat, [&] {
+    //     scan_naive<threads_per_block><<<n_blocks, threads_per_block>>>
+    //         (thrust::raw_pointer_cast(y.data()),
+    //          thrust::raw_pointer_cast(x.data()), n,
+    //          thrust::raw_pointer_cast(partial_sums.data()));
+    //   });
+    // thrust::fill(y.begin(), y.end(), 0.f);
+    // thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
+    // timeit("scan more efficient", n_repeat, [&] {
+    //     // thrust::fill(y.begin(), y.end(), 0.f);
+    //     scan_more_efficient<threads_per_block><<<n_blocks, threads_per_block>>>
+    //         (thrust::raw_pointer_cast(y.data()),
+    //          thrust::raw_pointer_cast(x.data()), n,
+    //          thrust::raw_pointer_cast(partial_sums.data()));
+    //   });
+    // thrust::fill(y.begin(), y.end(), 0.f);
+    // thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
+    // timeit("scan work efficient", n_repeat, [&] {
+    //     scan_work_efficient<threads_per_block>
+    //         <<<n_blocks/2, threads_per_block>>>(thrust::raw_pointer_cast(y.data()),
+    //                                             thrust::raw_pointer_cast(x.data()), n,
+    //                                             thrust::raw_pointer_cast(partial_sums.data()));
+    //   });
+    // thrust::fill(y.begin(), y.end(), 0.f);
+    // thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
+    // timeit("scan conflict free", n_repeat, [&] {
+    //     scan_conflict_free<threads_per_block>
+    //         <<<n_blocks/2, threads_per_block>>>(thrust::raw_pointer_cast(y.data()),
+    //                                             thrust::raw_pointer_cast(x.data()), n,
+    //                                             thrust::raw_pointer_cast(partial_sums.data()));
+    //   });
+    // thrust::fill(y.begin(), y.end(), 0.f);
+    // thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
+    // timeit("scan conflict free swizzle", n_repeat, [&] {
+    //     scan_conflict_free_swizzle<threads_per_block>
+    //         <<<n_blocks/2, threads_per_block>>>(thrust::raw_pointer_cast(y.data()),
+    //                                             thrust::raw_pointer_cast(x.data()), n,
+    //                                             thrust::raw_pointer_cast(partial_sums.data()));
+    //   });
+    // thrust::fill(y.begin(), y.end(), 0.f);
+    // thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
+    // timeit("scan on registers", n_repeat, [&] {
+    //     scan_on_registers<threads_per_block>
+    //         <<<n_blocks, threads_per_block>>>(thrust::raw_pointer_cast(y.data()),
+    //                                           thrust::raw_pointer_cast(x.data()), n,
+    //                                           thrust::raw_pointer_cast(partial_sums.data()));
+    //   });
 
     std::cout << "--- Full function passes ----" << std::endl;
     // this is not a fair comparison since thrust will do the full scan
@@ -484,14 +491,24 @@ auto main(int argc, char *argv[]) -> int {
     timeit("thrust", n_repeat, [&] {
         thrust::inclusive_scan(x.begin(), x.end(), y.begin());
       });
-    timeit("scan on registers", n_repeat, [&] {
+    if (threads_per_block < 512)
+      timeit("scan 3-pass naive", n_repeat, [&] {
+          scan(x, y, threads_per_block, threads_per_block, scan_naive<threads_per_block>);
+        });
+    timeit("scan 3-pass padding", n_repeat, [&] {
+        scan(x, y, threads_per_block, 2*threads_per_block, scan_conflict_free<threads_per_block>);
+      });
+    timeit("scan 3-pass swizzling", n_repeat, [&] {
+        scan(x, y, threads_per_block, 2*threads_per_block, scan_conflict_free_swizzle<threads_per_block>);
+      });
+    timeit("scan 3-pass on registers", n_repeat, [&] {
         scan(x, y, threads_per_block, threads_per_block, scan_on_registers<threads_per_block>);
       });
-    timeit("scan decoupled lookback", n_repeat, [&] {
-        scan_single_pass(x, y, threads_per_block, scan_decoupled_lookback<threads_per_block>);
-      });
-    timeit("scan parallel lookback", n_repeat, [&] {
-        scan_single_pass(x, y, threads_per_block, scan_parallel_lookback<threads_per_block>);
+    // timeit("scan decoupled lookback", n_repeat, [&] {
+    //     scan_single_pass(x, y, threads_per_block, scan_decoupled_lookback<threads_per_block>);
+    //   });
+    timeit("scan 1-pass warp lookback", n_repeat, [&] {
+        scan_single_pass(x, y, threads_per_block, scan_warp_lookback<threads_per_block>);
       });
 
   }
