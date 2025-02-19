@@ -48,11 +48,19 @@ __device__ float block_scan(int thread_value)
 
 static __device__ void store_status(ScanState *ptr, ScanState state)
 {
+  // auto *dst = reinterpret_cast<cuda::atomic<uint64_t, cuda::thread_scope_device>*>(ptr);
+  // auto *src = reinterpret_cast<uint64_t*>(&state);
+  // dst->store(*src, cuda::memory_order_relaxed);
   auto * src = reinterpret_cast<unsigned long long int*>(&state);
   auto * dst = reinterpret_cast<unsigned long long int*>(ptr);
   atomicExch(dst, *src);
+
+  // auto * src = reinterpret_cast<uint64_t*>(&state);
+  // auto * dst = reinterpret_cast<uint64_t*>(ptr);
+  // __stcg(dst, *src);
 }
 
+// template<typename thread_scope = cuda::thread_scope_device>
 static __device__ ScanState load_status(ScanState const *ptr)
 {
   ScanState state;
@@ -60,13 +68,12 @@ static __device__ ScanState load_status(ScanState const *ptr)
   auto dst = reinterpret_cast<uint64_t*>(&state);
   *dst = src->load(cuda::memory_order_relaxed);
   return state;
+
+  // auto const *src = reinterpret_cast<uint64_t const*>(ptr);
+  // auto dst = reinterpret_cast<uint64_t*>(&state);
+  // *dst = __ldcv(src);
+  // return state;
 }
-// static __device__ ScanState load_status(volatile ScanState const *ptr)
-// {
-//   ScanState state;
-//   *reinterpret_cast<uint64_t*>(&state) = *reinterpret_cast<volatile uint64_t const*>(ptr);
-//   return state;
-// }
 
 __device__ float serial_lookback(uint32_t chunk, ScanState* states)
 {
@@ -140,45 +147,6 @@ __device__ void warp_lookback(uint32_t chunk, ScanState* states,
   }
 }
 
-// __device__ void warp_lookback(uint32_t chunk, ScanState* states,
-//                               volatile float* sh_prefix_sum)
-// {
-//   ScanState synced_state{TileStatus::unavailable, 0.f};
-//   auto const lane = threadIdx.x;
-//   int prev_chunk = chunk - (WARP_SIZE - lane);
-//   constexpr int last_lane = WARP_SIZE - 1;
-//   int iter{0};
-//   while (synced_state.status != TileStatus::global_prefix_available) {
-//     ScanState prev_state = (prev_chunk >= 0) ?
-//                             load_status(&states[prev_chunk]) :
-//                             ScanState{TileStatus::global_prefix_available, 0.f};
-
-//     for (auto s = 1; s < WARP_SIZE; s *= 2) {
-//       auto const tmp = shfl_up_sync_status(prev_state, s);
-//       if (lane >= s) {
-//         if (tmp.status == TileStatus::unavailable) {
-//           prev_state.status = tmp.status;
-//         }
-//         else if (prev_state.status == TileStatus::local_prefix_available) {
-//           prev_state.sum += tmp.sum;
-//           prev_state.status = tmp.status;
-//         }
-//       }
-//     }
-
-//     synced_state = shfl_sync_status(prev_state, last_lane);
-//     iter++;
-//   }
-
-
-//   if (lane == last_lane) {
-//     *sh_prefix_sum = synced_state.sum;
-//     if (chunk == gridDim.x - 1) {
-//       printf("Num iter = %d\n", iter);
-//     }
-//   }
-// }
-
 template <int blockSize>
 __device__ bool block_any_sync(bool value)
 {
@@ -194,6 +162,7 @@ __device__ bool block_any_sync(bool value)
   return sh_chunk > 0;
 }
 
+// the correct status is stored in the last lane only!
 __device__ ScanState warp_accumulate_prefix(ScanState& thread_state)
 {
   auto const lane = threadIdx.x & (WARP_SIZE - 1);
@@ -254,26 +223,31 @@ template<int blockSize>
 __device__ float block_accumulate_prefix(ScanState& thread_state)
 {
   constexpr int shmem_size = blockSize/WARP_SIZE;
-  __shared__ ScanState warp_statuses[shmem_size];
+  __shared__ ScanState warp_states[shmem_size];
   __shared__ ScanState _ans;
 
   auto const tid = threadIdx.x;
   if (tid < shmem_size)
-    warp_statuses[tid] = ScanState{TileStatus::local_prefix_available, 0.f};
+    warp_states[tid] = ScanState{TileStatus::local_prefix_available, 0.f};
 
   // local accumulate
   thread_state = warp_accumulate_prefix(thread_state);
+  constexpr int last_lane = WARP_SIZE - 1;
+  // thread_state = shfl_sync_status(thread_state, last_lane);
   auto const warp = tid / WARP_SIZE;
   auto const lane = tid & (WARP_SIZE - 1);
-  if (lane == WARP_SIZE - 1)
-    warp_statuses[warp] = thread_state;
+  if (lane == last_lane) {
+    warp_states[warp] = thread_state;
+  }
   __syncthreads();
 
   if (warp == 0) {
-    auto warp_status = warp_statuses[lane];
-    warp_status = warp_accumulate_prefix(warp_status);
-    if (lane == WARP_SIZE - 1)
-      _ans = warp_status;
+    auto warp_state = (lane < shmem_size) ? warp_states[lane] : ScanState{TileStatus::local_prefix_available, 0.f};
+    warp_state = warp_accumulate_prefix(warp_state);
+    if (lane == WARP_SIZE - 1) {
+      _ans = warp_state;
+    }
+
   }
   __syncthreads();
 
@@ -287,16 +261,23 @@ __device__ float block_lookback(uint32_t chunk, ScanState* states)
   int thread_chunk = chunk - (blockSize - threadIdx.x);
   float prefix_sum{0.f};
   while (true) {
-    thread_state = (thread_chunk >= 0) ? load_status(&states[thread_chunk]) :
-                                        ScanState{TileStatus::global_prefix_available, 0.f};
+    // no need to block any sync right now
+    // thread_state = (thread_chunk >= 0) ? load_status(&states[thread_chunk]) :
+    //                                     ScanState{TileStatus::global_prefix_available, 0.f};
+    // auto const must_reload = block_any_sync<blockSize>(thread_state.status == TileStatus::unavailable);
+    // if (must_reload) continue;
+    // prefix_sum += thread_state.sum;
 
-    auto const must_reload = block_any_sync<blockSize>(thread_state.status == TileStatus::unavailable);
-    if (must_reload) continue;
-
+    // let warps load until the data is available indenpendently
+    do {
+      thread_state = (thread_chunk >= 0) ? load_status(&states[thread_chunk]) :
+          ScanState{TileStatus::global_prefix_available, 0.f};
+    } while (__any_sync(MASK_ALL, thread_state.status == TileStatus::unavailable));
     prefix_sum += thread_state.sum;
+    __syncthreads();
 
     // check if any thread ran into finished state
-    auto const any_finished = __any_sync(MASK_ALL, thread_state.status == TileStatus::global_prefix_available);
+    auto const any_finished = block_any_sync<blockSize>(thread_state.status == TileStatus::global_prefix_available);
     if (any_finished) break;
 
     // keep looking back

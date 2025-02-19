@@ -188,7 +188,22 @@ __global__ void scan_on_registers(float* out, float const* in, int n, float* par
   }
 }
 
+template <int blockSize>
+__global__ void scan_cub(float* out, float const* in, int n, float* partial_sums) {
+  using BlockScan = cub::BlockScan<float, blockSize>;
+  __shared__ typename BlockScan::TempStorage temp_storage;
 
+  auto i = blockIdx.x*blockDim.x + threadIdx.x;
+  auto thread_value = (i < n) ? in[i] : 0;
+
+  BlockScan(temp_storage).InclusiveSum(thread_value, thread_value, partial_sums[blockIdx.x]);
+  if (i < n)
+    out[i] = thread_value;
+
+  // if (threadIdx.x == blockSize-1) {
+  //   partial_sums[blockIdx.x] = thread_value;
+  // }
+}
 
 __host__ __device__ constexpr __forceinline__ int conflict_free_offset(int n) {
   return n + (n >> LOG_NUM_BANKS) + (n >> (2*LOG_NUM_BANKS));
@@ -305,7 +320,7 @@ auto timeit(std::string const & name, int nrepeat, auto && worker)
 
   auto const end_time = high_resolution_clock::now();
   auto const duration = (duration_cast<microseconds>(end_time - start_time)).count();
-  std::cout << "Test \'" << name << "\'"
+  std::cout << "Benchmark \'" << name << "\'"
             << " took " << (double)duration / (double)nrepeat << " [us]";
   if (nrepeat != 1) std::cout << " (average)";
   std::cout << std::endl;
@@ -347,6 +362,26 @@ void compare(std::string name, thrust::device_vector<float> const& y_true,
     std::cout << "Test " << name << " [passed ✅]" << std::endl;
   }
 }
+
+void cub_device_scan(thrust::device_vector<float> & in, thrust::device_vector<float> & out)
+{
+  int num_items = in.size();
+  float *d_in = thrust::raw_pointer_cast(in.data());
+  float *d_out = thrust::raw_pointer_cast(out.data());
+  // Determine temporary device storage requirements
+  void     *d_temp_storage = nullptr;
+  size_t   temp_storage_bytes = 0;
+  cub::DeviceScan::InclusiveSum(
+      d_temp_storage, temp_storage_bytes,
+      d_in, d_out, num_items);
+  // Allocate temporary storage
+  cudaMalloc(&d_temp_storage, temp_storage_bytes);
+  // Run exclusive prefix sum
+  cub::DeviceScan::InclusiveSum(
+      d_temp_storage, temp_storage_bytes,
+      d_in, d_out, num_items);
+}
+
 
 void scan(thrust::device_vector<float> & in,
           thrust::device_vector<float> & out,
@@ -408,6 +443,12 @@ auto main(int argc, char *argv[]) -> int {
     });
     compare("test scan on registers", y_true, y_test, [&] {
         scan(x, y_test, block_size, block_size, scan_on_registers<block_size>);
+    });
+    compare("test scan on CUB", y_true, y_test, [&] {
+        scan(x, y_test, block_size, block_size, scan_cub<block_size>);
+    });
+    compare("test device CUB", y_true, y_test, [&] {
+        cub_device_scan(x, y_test);
     });
     compare("scan single pass", y_true, y_test, [&] {
         scan_single_pass(x, y_test, block_size, scan_serial_lookback<block_size>);
@@ -491,6 +532,9 @@ auto main(int argc, char *argv[]) -> int {
     timeit("thrust", n_repeat, [&] {
         thrust::inclusive_scan(x.begin(), x.end(), y.begin());
       });
+    timeit("scan device CUB", n_repeat, [&] {
+        cub_device_scan(x, y);
+      });
     if (threads_per_block < 512)
       timeit("scan 3-pass naive", n_repeat, [&] {
           scan(x, y, threads_per_block, threads_per_block, scan_naive<threads_per_block>);
@@ -504,13 +548,18 @@ auto main(int argc, char *argv[]) -> int {
     timeit("scan 3-pass on registers", n_repeat, [&] {
         scan(x, y, threads_per_block, threads_per_block, scan_on_registers<threads_per_block>);
       });
+    timeit("scan 3-pass CUB", n_repeat, [&] {
+        scan(x, y, threads_per_block, threads_per_block, scan_cub<threads_per_block>);
+      });
     // timeit("scan decoupled lookback", n_repeat, [&] {
     //     scan_single_pass(x, y, threads_per_block, scan_decoupled_lookback<threads_per_block>);
     //   });
     timeit("scan 1-pass warp lookback", n_repeat, [&] {
         scan_single_pass(x, y, threads_per_block, scan_warp_lookback<threads_per_block>);
       });
-
+    timeit("scan 1-pass block lookback", n_repeat, [&] {
+        scan_single_pass(x, y, threads_per_block, scan_block_lookback<threads_per_block>);
+      });
   }
 
   return 0;
