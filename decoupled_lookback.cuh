@@ -106,47 +106,6 @@ static __device__ __forceinline__ ScanState shfl_sync_status(ScanState const& st
   return ret;
 }
 
-__device__ void warp_lookback(uint32_t chunk, ScanState* states,
-                              volatile float* sh_prefix_sum)
-{
-  ScanState synced_state{TileStatus::unavailable, 0.f};
-  auto const lane = threadIdx.x;
-  int prev_chunk = chunk - (WARP_SIZE - lane);
-  constexpr int last_lane = WARP_SIZE - 1;
-  int iter{0};
-  while (synced_state.status != TileStatus::global_prefix_available) {
-    ScanState prev_state = (prev_chunk >= 0) ?
-                            load_status(&states[prev_chunk]) :
-                            ScanState{TileStatus::global_prefix_available, 0.f};
-
-    for (auto s = 1; s < WARP_SIZE; s *= 2) {
-      auto const tmp = shfl_up_sync_status(prev_state, s);
-      if (lane >= s) {
-        if (tmp.status == TileStatus::unavailable) {
-          prev_state.status = tmp.status;
-          prev_state.sum = 0;
-        }
-        else if (prev_state.status == TileStatus::local_prefix_available) {
-          prev_state.sum += tmp.sum;
-          prev_state.status = tmp.status;
-        }
-      }
-    }
-
-    auto old_sum = synced_state.sum;
-    synced_state = shfl_sync_status(prev_state, last_lane);
-    synced_state.sum += old_sum;
-    if (synced_state.status == TileStatus::local_prefix_available)
-      prev_chunk -= WARP_SIZE;
-    iter++;
-  }
-
-
-  if (lane == last_lane) {
-    *sh_prefix_sum = synced_state.sum;
-  }
-}
-
 template <int blockSize>
 __device__ bool block_any_sync(bool value)
 {
@@ -163,7 +122,7 @@ __device__ bool block_any_sync(bool value)
 }
 
 // the correct status is stored in the last lane only!
-__device__ ScanState warp_accumulate_prefix(ScanState& thread_state)
+__device__ ScanState warp_accumulate_prefix(ScanState thread_state)
 {
   auto const lane = threadIdx.x & (WARP_SIZE - 1);
   for (auto s = 1; s < WARP_SIZE; s *= 2) {
@@ -182,8 +141,43 @@ __device__ ScanState warp_accumulate_prefix(ScanState& thread_state)
   return thread_state;
 }
 
+__device__ ScanState warp_accumulate_final_prefix_cub(ScanState thread_state)
+{
+  // set to zero all but the last lanes with global prefix
+  auto const lane = threadIdx.x & (WARP_SIZE - 1);
+  const auto final_mask = __ballot_sync(MASK_ALL, thread_state.status == TileStatus::global_prefix_available);
+  const int last_lane_with_global_prefix = WARP_SIZE - 1 - __clz(final_mask);
+  thread_state.sum = (lane < last_lane_with_global_prefix) ? 0.f : thread_state.sum;
 
-__device__ void warp_lookback_fast(uint32_t chunk, ScanState* states,
+  using WarpReduce = cub::WarpReduce<float>;
+  __shared__ typename WarpReduce::TempStorage temp_storage;
+  thread_state.sum = WarpReduce(temp_storage).Sum(thread_state.sum);
+  thread_state.sum = __shfl_sync(MASK_ALL, thread_state.sum, 0);
+  __syncwarp();
+
+  return thread_state;
+}
+
+__device__ ScanState warp_accumulate_final_prefix(ScanState thread_state)
+{
+  // set to zero all but the last lanes with global prefix
+  auto const lane = threadIdx.x & (WARP_SIZE - 1);
+  const auto final_mask = __ballot_sync(MASK_ALL, thread_state.status == TileStatus::global_prefix_available);
+  const int last_lane_with_global_prefix = WARP_SIZE - 1 - __clz(final_mask);
+  thread_state.sum = (lane < last_lane_with_global_prefix) ? 0.f : thread_state.sum;
+
+  for (auto s = 1; s < WARP_SIZE; s *= 2) {
+    auto const tmp = __shfl_up_sync(MASK_ALL, thread_state.sum, s);
+    if (lane >= s) {
+      thread_state.sum += tmp;
+    }
+  }
+  thread_state.sum = __shfl_sync(MASK_ALL, thread_state.sum, WARP_SIZE - 1);
+  return thread_state;
+}
+
+
+__device__ void warp_lookback(uint32_t chunk, ScanState* states,
                                    volatile float* sh_prefix_sum)
 {
   auto const lane = threadIdx.x;
@@ -211,8 +205,8 @@ __device__ void warp_lookback_fast(uint32_t chunk, ScanState* states,
   }
 
   thread_state.sum = prefix_sum;
-
-  thread_state = warp_accumulate_prefix(thread_state);
+  // thread_state = warp_accumulate_final_prefix_cub(thread_state);
+  thread_state = warp_accumulate_final_prefix(thread_state);
 
   if (lane == last_lane) {
     *sh_prefix_sum = thread_state.sum;
@@ -342,12 +336,15 @@ __global__ void scan_warp_lookback(float* out, float const* in, int n,
   // update chunk status to local
   bool const last_thread_in_block = (tid == blockSize - 1);
   if (last_thread_in_block) {
-    store_status(&states[chunk], ScanState{TileStatus::local_prefix_available, local_sum});
+    // store_status(&states[chunk], ScanState{TileStatus::local_prefix_available, local_sum});
+    auto const status = (chunk != 0) ? TileStatus::local_prefix_available :
+                                       TileStatus::global_prefix_available;
+    store_status(&states[chunk], ScanState{status, local_sum});
   }
 
   // lookback
   if (threadIdx.x < WARP_SIZE)
-    warp_lookback_fast(chunk, states, &sh_prefix_sum);
+    warp_lookback(chunk, states, &sh_prefix_sum);
   __syncthreads();
 
   // aggregate result
@@ -382,7 +379,9 @@ __global__ void scan_block_lookback(float* out, float const* in, int n,
   // update chunk status to local
   bool const last_thread_in_block = (tid == blockSize - 1);
   if (last_thread_in_block) {
-    store_status(&states[chunk], ScanState{TileStatus::local_prefix_available, local_sum});
+    auto const status = (chunk != 0) ? TileStatus::local_prefix_available :
+                                       TileStatus::global_prefix_available;
+    store_status(&states[chunk], ScanState{status, local_sum});
   }
 
   // lookback
