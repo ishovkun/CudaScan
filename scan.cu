@@ -467,7 +467,6 @@ auto main(int argc, char *argv[]) -> int {
     thrust::device_vector<float> x(n);
     thrust::sequence(x.begin(), x.end());
     thrust::device_vector<float> y(n, 0.f);
-    // constexpr int threads_per_block = 256;
     constexpr int threads_per_block = 512;
     int n_repeat = 100;
     if (argc == 2) {

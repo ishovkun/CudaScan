@@ -289,8 +289,11 @@ __global__ void scan_serial_lookback(float* out, float const* in, int n,
   __shared__ uint sh_chunk;
 
   auto tid = threadIdx.x;
-  if (tid == 0)
-    sh_chunk = atomicAdd(tile_counter, 1u);
+  if (tid == 0) {
+    auto chunk = atomicAdd(tile_counter, 1u);
+    store_status(&states[chunk], ScanState{TileStatus::unavailable, 0.f});
+    sh_chunk = chunk;
+  }
   __syncthreads();
 
   auto const chunk = sh_chunk;
@@ -323,8 +326,11 @@ __global__ void scan_warp_lookback(float* out, float const* in, int n,
 
   // select chunk to work on
   auto tid = threadIdx.x;
-  if (tid == 0)
-    sh_chunk = atomicAdd(tile_counter, 1u);
+  if (tid == 0) {
+    auto chunk = atomicAdd(tile_counter, 1u);
+    store_status(&states[chunk], ScanState{TileStatus::unavailable, 0.f});
+    sh_chunk = chunk;
+  }
   __syncthreads();
 
   // local prefix sum
@@ -366,8 +372,11 @@ __global__ void scan_block_lookback(float* out, float const* in, int n,
   auto tid = threadIdx.x;
   // select chunk to work on
   __shared__ uint sh_chunk;
-  if (tid == 0)
-    sh_chunk = atomicAdd(tile_counter, 1u);
+  if (tid == 0) {
+    auto chunk = atomicAdd(tile_counter, 1u);
+    store_status(&states[chunk], ScanState{TileStatus::unavailable, 0.f});
+    sh_chunk = chunk;
+  }
   __syncthreads();
 
   // local prefix sum
@@ -409,7 +418,6 @@ void scan_single_pass(thrust::device_vector<float> & in,
   int64_t numBlocks = (in.size() + blockSize - 1) / blockSize;
 
   thrust::device_vector<ScanState> states(numBlocks);
-  thrust::fill(states.begin(), states.end(), ScanState{TileStatus::unavailable, 0.f});
 
   launch_kernel<<<numBlocks, blockSize>>>
       (out.data().get(), in.data().get(), in.size(), states.data().get(), tile_counter);
