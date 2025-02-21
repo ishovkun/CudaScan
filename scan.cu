@@ -6,302 +6,9 @@
 #include <thrust/logical.h>
 #include <thrust/iterator/zip_iterator.h>
 #include "decoupled_lookback.cuh"
+#include "three_pass.cuh"
 #include "common.cuh"
 #include <iomanip>
-
-#define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
-static inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true) {
-  if (code != cudaSuccess)
-  {
-    fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
-    std::cout << "GPU assert failed" << std::endl;
-    if (abort) exit(code);
-  }
-}
-
-__global__ void add_partial_sums(float* out, float* partial_sums, int n) {
-  auto blockOffset = blockIdx.x * blockDim.x;
-  auto tid = threadIdx.x;
-  if (blockIdx.x > 0 && blockOffset + tid < n) {
-    out[blockOffset + tid] += partial_sums[blockIdx.x - 1];
-  }
-}
-
-template <int blockSize>
-__global__ void scan_naive(float* out, float* in, int n, float* partial_sums) {
-  auto tid = threadIdx.x;
-  auto i = blockIdx.x * blockDim.x + threadIdx.x;
-  __shared__ float sh[blockSize];
-  if (i < n) sh[tid] = in[i];
-  else       sh[tid] = 0.f;
-  __syncthreads();
-
-  // Double buffering, the table prints whatever in the output buffer
-  // idx  | 0  | 1      | 2       | 3      | 4      | 5      | 6      | 7      | 8      | 9       | 10       | 11      | 12      | 13      | 14       | 15       |
-  // | init | x0 | x1     | x2      | x3     | x4     | x5     | x6     | x7     | x8     | x9      | x10      | x11     | x12     | x13     | x14      | x15      |
-  // | s=1  | x0 | x0,x1  | x1,x2   | x2,x3  | x3,x4  | x4, x5 | x5,x6  | x6,x7  | x7,x8  | x8,x9   | x9,x10   | x10,x11 | x11,x12 | x12,x13 | x14      | x14,x15  |
-  // | s=2  | x0 | x0..x1 | x0...x2 | x0..x3 | x1..x4 | x2..x5 | x3..x6 | x4..x7 | x5..x8 | x6...x9 | x7...x10 | x7..x11 | x8..x12 | x9..x13 | x10..x14 | x11..x15 |
-  // | s=3  | x0 | x0..x1 | x0...x2 | x0..x3 | x0..x4 | x0..x5 | x0..x6 | x0..x7 | x1..x8 | x2...x9 | x3...x10 | x4..x11 | x5..x12 | x6..x13 | x7..x14  | x8..x15  |
-  int fin = 0; // flag, !fin = out
-  for (int s = 1; s < blockSize; s *= 2) {
-    if (tid >= s) {
-      sh[(!fin)*blockSize + tid] = sh[fin*blockSize + tid - s] + sh[fin*blockSize + tid];
-    } else {
-      sh[(!fin) * blockSize + tid] = sh[fin * blockSize + tid];
-    }
-
-    fin = !fin;
-    __syncthreads();
-  }
-  out[i] = sh[(fin)*blockSize + tid];
-  if (tid == 0) partial_sums[blockIdx.x] = sh[fin*blockSize + blockSize-1];
-}
-
-template <int blockSize>
-__global__ void scan_more_efficient(float* out, float const* in, int n, float* partial_sums) {
-  auto tid = threadIdx.x;
-  auto i = blockIdx.x * blockDim.x + threadIdx.x;
-  __shared__ float sh[blockSize];
-  if (i < n) sh[tid] = in[i];
-  else       sh[tid] = 0.f;
-  __syncthreads();
-
-  // upsweep
-  /*
-      | idx  | 0 | 1 | 2 |  3 | 4 |  5 | 6 |  7 | 8 |  9 | 10 | 11 | 12 | 13 | 14 |  15 |
-      | init | 1 | 2 | 3 |  4 | 5 |  6 | 7 |  8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 |  16 |
-              \---|   \----|    \--|    \----|   \---|    \-----|    \----|   \-----|
-      | s=1  |   | 3 |   |  7 |   | 11 |   | 15 |   | 19 |    | 23 |    | 27 |    |  31 |
-                  \--------|        \--------|        \---------|        \----------|
-      | s=2  |   |   |   | 10 |   |    |   | 26 |   |    |    | 42 |    |    |    |  58 |
-                            \----------------|                   \-------------------|
-      | s=4  |   |   |   |    |   |    |   | 36 |   |    |    |    |    |    |    | 100 |
-                                              \--------------------------------------|
-      | s=8  |   |   |   |    |   |    |   |    |   |    |    |    |    |    |    | 136 |
-  */
-  for (int s = 1; s < blockSize; s *= 2) {
-    if ((tid+1) % (2*s) == 0) {
-      sh[tid] += sh[tid-s];
-    }
-    __syncthreads();
-  }
-  if (tid == blockSize - 1) {
-    partial_sums[blockIdx.x] = sh[tid];
-  }
-  /*
-    downsweep
-    | idx  | 0 | 1 | 2 |  3 |  4 |  5 |  6 | 7  |  8 |  9 | 10 | 11 | 12 | 13 | 14 |  15 |
-    | init | 1 | 3 | 3 | 10 |  5 | 11 |  7 | 36 |  9 | 19 | 11 | 42 | 13 | 27 | 15 | 136 |
-                                            \--------->>--------\
-    | s=4  |   |   |   |    |    |    |    | X  |    |    |    | 78 |    |    |    |     |
-                          \--->>----\       \--->>----\          \--->>---\
-    | s=2  |   |   |   |  X |    | 21 |    | X  |    | 55 |    |  X |    | 69 |    |     |
-                \->-\    \->-\     \->-\    \->-\      \->-\     \->-\     \->-\
-    | s=1  |   | X | 6 |  X | 15 |  X | 28 | X  | 45 |  X | 66 |  X | 91 |  X | 85 |     |
-   */
-  for (int s = blockSize/2; s > 0; s /= 2) {
-    if ((tid+1) % (2*s) == 0) {
-      sh[tid+s] += sh[tid];
-    }
-    __syncthreads();
-  }
-  if (i < n) out[i] = sh[tid];
-}
-
-template <int blockSize>
-__global__ void scan_work_efficient(float* out, float const* in, int n, float* partial_sums) {
-  __shared__ float sh[2*blockSize];
-
-  auto tid = threadIdx.x;
-  auto ia = blockIdx.x * 2* blockSize + threadIdx.x;
-  auto ib = blockIdx.x * 2* blockSize + threadIdx.x + blockSize;
-  if (ia < n) sh[tid] = in[ia];
-  else sh[tid] = 0;
-  if (ib) sh[tid+blockSize] = in[ib];
-  else sh[tid+blockSize] = 0;
-  __syncthreads();
-
-  // upsweep
-  // the rest is the same as in the previous function, apart from
-  // the s limit: in the previous function it was [1, blockSize/2],
-  // now it's [1, blockSize]
-  for (int s = 1; s <= blockSize; s *= 2) {
-    auto idx = 2*s*tid + s - 1;
-    if (idx+s < 2*blockSize) {
-      sh[idx+s] += sh[idx];
-    }
-    __syncthreads();
-  }
-  if (tid == 0) {
-    partial_sums[blockIdx.x] = sh[2*blockSize-1];
-  }
-  // no need to __syncthreads(); (we don't touch the last element)
-  for (int s = blockSize; s > 0; s /= 2) {
-    auto idx = 2*s*(tid+1) - 1;
-    if (idx + s < 2*blockSize) {
-      sh[idx+s] += sh[idx];
-    }
-    __syncthreads();
-  }
-  if (ia < n) {
-    out[ia] = sh[tid];
-  }
-  if (ib < n) {
-    out[ib] = sh[tid+blockSize];
-  }
-}
-
-template <int blockSize>
-__global__ void scan_on_registers(float* out, float const* in, int n, float* partial_sums) {
-  // extra element to avoid ifs for thread 0
-  constexpr int shmem_size = 1 + blockSize/WARP_SIZE;
-  __shared__ float warp_sums[shmem_size];
-  // fill shared sums with zero
-  // we should really only set warp_sums[0] = 0
-  auto tid = threadIdx.x;
-  if (tid < shmem_size)
-    warp_sums[tid] = 0.f;
-
-  auto i = blockIdx.x*blockDim.x + threadIdx.x;
-  auto thread_value = (i < n) ? in[i] : 0;
-
-  auto thread_prefix_within_warp = warp_scan(thread_value);
-  __syncthreads();
-
-  auto warp = threadIdx.x / WARP_SIZE;
-  auto lane = threadIdx.x & (WARP_SIZE-1);
-  if (lane == WARP_SIZE-1)
-    warp_sums[1+warp] = thread_prefix_within_warp;
-  __syncthreads();
-
-  // scan warp sums in a separate warp
-  // max block size = 1024; 1024/32 = 32 -> should fit inside a warp
-  if (warp == 0)
-    warp_sums[1+lane] = warp_scan(warp_sums[1+lane]);
-  __syncthreads();
-
-  if (i < n) {
-    out[i] = thread_prefix_within_warp + warp_sums[warp];
-  }
-  if (tid == 0) {
-    partial_sums[blockIdx.x] = warp_sums[shmem_size - 1];
-  }
-}
-
-template <int blockSize>
-__global__ void scan_cub(float* out, float const* in, int n, float* partial_sums) {
-  using BlockScan = cub::BlockScan<float, blockSize>;
-  __shared__ typename BlockScan::TempStorage temp_storage;
-
-  auto i = blockIdx.x*blockDim.x + threadIdx.x;
-  auto thread_value = (i < n) ? in[i] : 0;
-
-  BlockScan(temp_storage).InclusiveSum(thread_value, thread_value, partial_sums[blockIdx.x]);
-  if (i < n)
-    out[i] = thread_value;
-
-  // if (threadIdx.x == blockSize-1) {
-  //   partial_sums[blockIdx.x] = thread_value;
-  // }
-}
-
-__host__ __device__ constexpr __forceinline__ int conflict_free_offset(int n) {
-  return n + (n >> LOG_NUM_BANKS) + (n >> (2*LOG_NUM_BANKS));
-}
-
-template <int blockSize>
-__global__ void scan_conflict_free(float* out, float const* in, int n, float* partial_sums) {
-  constexpr int shmem_size =  conflict_free_offset(2*blockSize);
-  __shared__ float sh[shmem_size];
-  auto tid = threadIdx.x;
-  auto i = blockIdx.x * blockDim.x + threadIdx.x;
-
-  auto a_base = conflict_free_offset(2*tid);
-  auto b_base = conflict_free_offset(2*tid+1);
-
-  if (2*i < n) sh[a_base] = in[2*i];
-  else sh[a_base] = 0;
-  if (2*i+1 < n) sh[b_base] = in[2*i+1];
-  else sh[b_base] = 0;
-  __syncthreads();
-
-  // upsweep
-  for (int s = 1; s <= blockSize; s *= 2) {
-    auto idx = 2*s*tid + s - 1;
-    if (idx+s < 2*blockSize) {
-      sh[conflict_free_offset(idx+s)] += sh[conflict_free_offset(idx)];
-    }
-    __syncthreads();
-  }
-
-  if (tid == 0) {
-    partial_sums[blockIdx.x] = sh[conflict_free_offset(2*blockSize-1)];
-  }
-
-  // downsweep
-  for (int s = blockSize; s > 0; s /= 2) {
-    auto idx = 2*s*(tid+1) - 1;
-    if (idx + s < 2*blockSize) {
-      sh[conflict_free_offset(idx+s)] += sh[conflict_free_offset(idx)];
-    }
-    __syncthreads();
-  }
-  // write results
-  if (2*i < n) {
-    out[2*i] = sh[a_base];
-  }
-  if (2*i+1 < n) {
-    out[2*i+1] = sh[b_base];
-  }
-}
-
-__device__ constexpr __forceinline__ int swizzle(int i) {
-  return i ^ (i >> 5);
-}
-
-template <int blockSize>
-__global__ void scan_conflict_free_swizzle(float* out, float const* in, int n, float* partial_sums) {
-  __shared__ float sh[2*blockSize];
-  auto tid = threadIdx.x;
-  auto i = blockIdx.x * blockDim.x + threadIdx.x;
-
-  auto a_base = swizzle(2*tid);
-  auto b_base = swizzle(2*tid+1);
-  if (2*i < n) sh[a_base] = in[2*i];
-  else sh[a_base] = 0;
-  if (2*i+1 < n) sh[b_base] = in[2*i+1];
-  else sh[b_base] = 0;
-  __syncthreads();
-
-  // upsweep
-  for (int s = 1; s <= blockSize; s *= 2) {
-    auto idx = 2*s*tid + s - 1;
-    if (idx+s < 2*blockSize) {
-      sh[swizzle(idx+s)] += sh[swizzle(idx)];
-    }
-    __syncthreads();
-  }
-
-  if (tid == 0) {
-    partial_sums[blockIdx.x] = sh[swizzle(2*blockSize-1)];
-  }
-
-  // downsweep
-  for (int s = blockSize; s > 0; s /= 2) {
-    auto idx = 2*s*(tid+1) - 1;
-    if (idx + s < 2*blockSize) {
-      sh[swizzle(idx+s)] += sh[swizzle(idx)];
-    }
-    __syncthreads();
-  }
-  // write results
-  if (2*i < n) {
-    out[2*i] = sh[a_base];
-  }
-  if (2*i+1 < n) {
-    out[2*i+1] = sh[b_base];
-  }
-}
 
 auto timeit(std::string const & name, int nrepeat, auto && worker)
 {
@@ -363,54 +70,6 @@ void compare(std::string name, thrust::device_vector<float> const& y_true,
   }
 }
 
-void cub_device_scan(thrust::device_vector<float> & in, thrust::device_vector<float> & out)
-{
-  int num_items = in.size();
-  float *d_in = thrust::raw_pointer_cast(in.data());
-  float *d_out = thrust::raw_pointer_cast(out.data());
-  // Determine temporary device storage requirements
-  void     *d_temp_storage = nullptr;
-  size_t   temp_storage_bytes = 0;
-  cub::DeviceScan::InclusiveSum(
-      d_temp_storage, temp_storage_bytes,
-      d_in, d_out, num_items);
-  // Allocate temporary storage
-  cudaMalloc(&d_temp_storage, temp_storage_bytes);
-  // Run exclusive prefix sum
-  cub::DeviceScan::InclusiveSum(
-      d_temp_storage, temp_storage_bytes,
-      d_in, d_out, num_items);
-}
-
-
-void scan(thrust::device_vector<float> & in,
-          thrust::device_vector<float> & out,
-          int block_size, int tile_size, auto && scan_kernel) {
-  auto problem_size = in.size();
-  int num_blocks = (problem_size + tile_size - 1) / tile_size;
-
-  thrust::device_vector<float> partial_sums(num_blocks, 0);
-
-  scan_kernel<<<num_blocks, block_size>>>(thrust::raw_pointer_cast(out.data()),
-                                          thrust::raw_pointer_cast(in.data()),
-                                          problem_size,
-                                          thrust::raw_pointer_cast(partial_sums.data()));
-  gpuErrchk(cudaPeekAtLastError());
-  gpuErrchk(cudaDeviceSynchronize());
-
-  if (num_blocks > 1) {
-
-    thrust::device_vector<float> partial_sums_of_partial_sums(num_blocks, 0);
-    scan(partial_sums, partial_sums_of_partial_sums, block_size, tile_size, scan_kernel);
-
-    add_partial_sums<<<num_blocks, tile_size>>>(thrust::raw_pointer_cast(out.data()),
-                                                thrust::raw_pointer_cast(partial_sums_of_partial_sums.data()),
-                                                problem_size);
-    gpuErrchk(cudaPeekAtLastError());
-    gpuErrchk(cudaDeviceSynchronize());
-  }
-}
-
 auto main(int argc, char *argv[]) -> int {
 
   if (argc == 1)
@@ -425,7 +84,7 @@ auto main(int argc, char *argv[]) -> int {
     thrust::device_vector<float> y_test(n, 0);
     thrust::inclusive_scan(x.begin(), x.end(), y_true.begin());
 
-    // void scan(in, out, block_size, tile_size,  scan_kernel) ;
+    // // void scan(in, out, block_size, tile_size,  scan_kernel) ;
     compare("test naive", y_true, y_test, [&] {
         scan(x, y_test, block_size, block_size, scan_naive<block_size>);
     });
@@ -447,6 +106,10 @@ auto main(int argc, char *argv[]) -> int {
     compare("test scan on CUB", y_true, y_test, [&] {
         scan(x, y_test, block_size, block_size, scan_cub<block_size>);
     });
+    // compare("test fancy scan on CUB", y_true, y_test, [&] {
+    //     constexpr int items_per_thread = 2;
+    //     scan(x, y_test, block_size, items_per_thread*block_size, scan_cub_fancy<block_size, items_per_thread>);
+    // });
     compare("test device CUB", y_true, y_test, [&] {
         cub_device_scan(x, y_test);
     });
@@ -455,6 +118,9 @@ auto main(int argc, char *argv[]) -> int {
     });
     compare("scan warp lookback", y_true, y_test, [&] {
         scan_single_pass(x, y_test, block_size, scan_warp_lookback<block_size>);
+    });
+    compare("scan warp lookback blockload", y_true, y_test, [&] {
+        scan_single_pass(x, y_test, block_size, scan_warp_lookback_blockload<block_size>);
     });
     compare("scan block lookback", y_true, y_test, [&] {
         scan_single_pass(x, y_test, block_size, scan_block_lookback<block_size>);
@@ -467,65 +133,65 @@ auto main(int argc, char *argv[]) -> int {
     thrust::device_vector<float> x(n);
     thrust::sequence(x.begin(), x.end());
     thrust::device_vector<float> y(n, 0.f);
-    constexpr int threads_per_block = 512;
+    constexpr int blockSize = 512;
     int n_repeat = 100;
     if (argc == 2) {
       n_repeat = std::stoi(argv[1]);
     }
-    // int n_blocks = (x.size() + threads_per_block - 1) / threads_per_block;
-    // std::vector<float> partial_sums(n_blocks, 0);
+    int n_blocks = (x.size() + blockSize - 1) / blockSize;
+    std::vector<float> partial_sums(n_blocks, 0);
 
-    // thrust::fill(y.begin(), y.end(), 0.f);
-    // thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
-    // timeit("scan naive", n_repeat, [&] {
-    //     scan_naive<threads_per_block><<<n_blocks, threads_per_block>>>
-    //         (thrust::raw_pointer_cast(y.data()),
-    //          thrust::raw_pointer_cast(x.data()), n,
-    //          thrust::raw_pointer_cast(partial_sums.data()));
-    //   });
-    // thrust::fill(y.begin(), y.end(), 0.f);
-    // thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
-    // timeit("scan more efficient", n_repeat, [&] {
-    //     // thrust::fill(y.begin(), y.end(), 0.f);
-    //     scan_more_efficient<threads_per_block><<<n_blocks, threads_per_block>>>
-    //         (thrust::raw_pointer_cast(y.data()),
-    //          thrust::raw_pointer_cast(x.data()), n,
-    //          thrust::raw_pointer_cast(partial_sums.data()));
-    //   });
-    // thrust::fill(y.begin(), y.end(), 0.f);
-    // thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
-    // timeit("scan work efficient", n_repeat, [&] {
-    //     scan_work_efficient<threads_per_block>
-    //         <<<n_blocks/2, threads_per_block>>>(thrust::raw_pointer_cast(y.data()),
-    //                                             thrust::raw_pointer_cast(x.data()), n,
-    //                                             thrust::raw_pointer_cast(partial_sums.data()));
-    //   });
-    // thrust::fill(y.begin(), y.end(), 0.f);
-    // thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
-    // timeit("scan conflict free", n_repeat, [&] {
-    //     scan_conflict_free<threads_per_block>
-    //         <<<n_blocks/2, threads_per_block>>>(thrust::raw_pointer_cast(y.data()),
-    //                                             thrust::raw_pointer_cast(x.data()), n,
-    //                                             thrust::raw_pointer_cast(partial_sums.data()));
-    //   });
-    // thrust::fill(y.begin(), y.end(), 0.f);
-    // thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
-    // timeit("scan conflict free swizzle", n_repeat, [&] {
-    //     scan_conflict_free_swizzle<threads_per_block>
-    //         <<<n_blocks/2, threads_per_block>>>(thrust::raw_pointer_cast(y.data()),
-    //                                             thrust::raw_pointer_cast(x.data()), n,
-    //                                             thrust::raw_pointer_cast(partial_sums.data()));
-    //   });
-    // thrust::fill(y.begin(), y.end(), 0.f);
-    // thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
-    // timeit("scan on registers", n_repeat, [&] {
-    //     scan_on_registers<threads_per_block>
-    //         <<<n_blocks, threads_per_block>>>(thrust::raw_pointer_cast(y.data()),
-    //                                           thrust::raw_pointer_cast(x.data()), n,
-    //                                           thrust::raw_pointer_cast(partial_sums.data()));
-    //   });
+  //   // thrust::fill(y.begin(), y.end(), 0.f);
+  //   // thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
+  //   // timeit("scan naive", n_repeat, [&] {
+  //   //     scan_naive<blockSize><<<n_blocks, blockSize>>>
+  //   //         (thrust::raw_pointer_cast(y.data()),
+  //   //          thrust::raw_pointer_cast(x.data()), n,
+  //   //          thrust::raw_pointer_cast(partial_sums.data()));
+  //   //   });
+  //   // thrust::fill(y.begin(), y.end(), 0.f);
+  //   // thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
+  //   // timeit("scan more efficient", n_repeat, [&] {
+  //   //     // thrust::fill(y.begin(), y.end(), 0.f);
+  //   //     scan_more_efficient<blockSize><<<n_blocks, blockSize>>>
+  //   //         (thrust::raw_pointer_cast(y.data()),
+  //   //          thrust::raw_pointer_cast(x.data()), n,
+  //   //          thrust::raw_pointer_cast(partial_sums.data()));
+  //   //   });
+  //   // thrust::fill(y.begin(), y.end(), 0.f);
+  //   // thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
+  //   // timeit("scan work efficient", n_repeat, [&] {
+  //   //     scan_work_efficient<blockSize>
+  //   //         <<<n_blocks/2, blockSize>>>(thrust::raw_pointer_cast(y.data()),
+  //   //                                             thrust::raw_pointer_cast(x.data()), n,
+  //   //                                             thrust::raw_pointer_cast(partial_sums.data()));
+  //   //   });
+  //   // thrust::fill(y.begin(), y.end(), 0.f);
+  //   // thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
+  //   // timeit("scan conflict free", n_repeat, [&] {
+  //   //     scan_conflict_free<blockSize>
+  //   //         <<<n_blocks/2, blockSize>>>(thrust::raw_pointer_cast(y.data()),
+  //   //                                             thrust::raw_pointer_cast(x.data()), n,
+  //   //                                             thrust::raw_pointer_cast(partial_sums.data()));
+  //   //   });
+  //   // thrust::fill(y.begin(), y.end(), 0.f);
+  //   // thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
+  //   // timeit("scan conflict free swizzle", n_repeat, [&] {
+  //   //     scan_conflict_free_swizzle<blockSize>
+  //   //         <<<n_blocks/2, blockSize>>>(thrust::raw_pointer_cast(y.data()),
+  //   //                                             thrust::raw_pointer_cast(x.data()), n,
+  //   //                                             thrust::raw_pointer_cast(partial_sums.data()));
+  //   //   });
+  //   // thrust::fill(y.begin(), y.end(), 0.f);
+  //   // thrust::fill(partial_sums.begin(), partial_sums.end(), 0.f);
+  //   // timeit("scan on registers", n_repeat, [&] {
+  //   //     scan_on_registers<blockSize>
+  //   //         <<<n_blocks, blockSize>>>(thrust::raw_pointer_cast(y.data()),
+  //   //                                           thrust::raw_pointer_cast(x.data()), n,
+  //   //                                           thrust::raw_pointer_cast(partial_sums.data()));
+  //   //   });
 
-    std::cout << "--- Full function passes ----" << std::endl;
+  //   std::cout << "--- Full function passes ----" << std::endl;
     // this is not a fair comparison since thrust will do the full scan
     // as opposed to a single step
     timeit("thrust", n_repeat, [&] {
@@ -534,31 +200,54 @@ auto main(int argc, char *argv[]) -> int {
     timeit("scan device CUB", n_repeat, [&] {
         cub_device_scan(x, y);
       });
-    if (threads_per_block < 512)
+    if (blockSize < 512)
       timeit("scan 3-pass naive", n_repeat, [&] {
-          scan(x, y, threads_per_block, threads_per_block, scan_naive<threads_per_block>);
+          scan(x, y, blockSize, blockSize, scan_naive<blockSize>);
         });
     timeit("scan 3-pass padding", n_repeat, [&] {
-        scan(x, y, threads_per_block, 2*threads_per_block, scan_conflict_free<threads_per_block>);
+        scan(x, y, blockSize, 2*blockSize, scan_conflict_free<blockSize>);
       });
     timeit("scan 3-pass swizzling", n_repeat, [&] {
-        scan(x, y, threads_per_block, 2*threads_per_block, scan_conflict_free_swizzle<threads_per_block>);
+        scan(x, y, blockSize, 2*blockSize, scan_conflict_free_swizzle<blockSize>);
       });
-    timeit("scan 3-pass on registers", n_repeat, [&] {
-        scan(x, y, threads_per_block, threads_per_block, scan_on_registers<threads_per_block>);
+  timeit("scan 3-pass on registers", n_repeat, [&] {
+        scan(x, y, blockSize, blockSize, scan_on_registers<blockSize>);
       });
     timeit("scan 3-pass CUB", n_repeat, [&] {
-        scan(x, y, threads_per_block, threads_per_block, scan_cub<threads_per_block>);
+        scan(x, y, blockSize, blockSize, scan_cub<blockSize>);
       });
     // timeit("scan decoupled lookback", n_repeat, [&] {
-    //     scan_single_pass(x, y, threads_per_block, scan_decoupled_lookback<threads_per_block>);
+    //     scan_single_pass(x, y, blockSize, scan_decoupled_lookback<blockSize>);
     //   });
     timeit("scan 1-pass warp lookback", n_repeat, [&] {
-        scan_single_pass(x, y, threads_per_block, scan_warp_lookback<threads_per_block>);
+        scan_single_pass(x, y, blockSize, scan_warp_lookback<blockSize>);
       });
     timeit("scan 1-pass block lookback", n_repeat, [&] {
-        scan_single_pass(x, y, threads_per_block, scan_block_lookback<threads_per_block>);
+        scan_single_pass(x, y, blockSize, scan_block_lookback<blockSize>);
       });
+    timeit("scan 1-pass block lookback blockload", n_repeat, [&] {
+        scan_single_pass(x, y, blockSize, scan_warp_lookback_blockload<blockSize>);
+      });
+    // do not time memory allocations
+    // {
+    //   constexpr int blockSize = blockSize;
+    //   uint32_t* tile_counter;
+    //   cudaMalloc(&tile_counter, sizeof(uint32_t));
+    //   cudaMemset(tile_counter, 0, sizeof(unsigned int));
+
+    //   int64_t const numBlocks = (x.size() + blockSize - 1) / blockSize;
+
+    //   ScanState *states;
+    //   cudaMalloc(&states, numBlocks*sizeof(ScanState));
+    //   timeit("scan 1-pass warp lookback noalloc", n_repeat, [&] {
+    //       cudaMemset(tile_counter, 0, sizeof(unsigned int));
+    //       scan_warp_lookback<blockSize><<<numBlocks, blockSize>>>
+    //           (y.data().get(), x.data().get(), x.size(), states, tile_counter);
+    //     });
+
+    //   cudaFree(states);
+    //   cudaFree(tile_counter);
+    // }
   }
 
   return 0;
