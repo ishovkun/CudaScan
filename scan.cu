@@ -106,10 +106,10 @@ auto main(int argc, char *argv[]) -> int {
     compare("test scan on CUB", y_true, y_test, [&] {
         scan(x, y_test, block_size, block_size, scan_cub<block_size>);
     });
-    // compare("test fancy scan on CUB", y_true, y_test, [&] {
-    //     constexpr int items_per_thread = 2;
-    //     scan(x, y_test, block_size, items_per_thread*block_size, scan_cub_fancy<block_size, items_per_thread>);
-    // });
+    compare("test fancy scan on CUB", y_true, y_test, [&] {
+        constexpr int items_per_thread = 2;
+        scan(x, y_test, block_size, items_per_thread*block_size, scan_cub_fancy<block_size, items_per_thread>);
+    });
     compare("test device CUB", y_true, y_test, [&] {
         cub_device_scan(x, y_test);
     });
@@ -118,6 +118,10 @@ auto main(int argc, char *argv[]) -> int {
     });
     compare("scan warp lookback", y_true, y_test, [&] {
         scan_single_pass(x, y_test, block_size, scan_warp_lookback<block_size>);
+    });
+    compare("scan cubbish warp lookback", y_true, y_test, [&] {
+        constexpr int itemsPerThread = 2;
+        scan_single_pass(x, y_test, block_size, scan_cubbish_warp_lookback<block_size,itemsPerThread>, itemsPerThread);
     });
     compare("scan warp lookback blockload", y_true, y_test, [&] {
         scan_single_pass(x, y_test, block_size, scan_warp_lookback_blockload<block_size>);
@@ -200,34 +204,49 @@ auto main(int argc, char *argv[]) -> int {
     timeit("scan device CUB", n_repeat, [&] {
         cub_device_scan(x, y);
       });
-    if (blockSize < 512)
-      timeit("scan 3-pass naive", n_repeat, [&] {
-          scan(x, y, blockSize, blockSize, scan_naive<blockSize>);
-        });
-    timeit("scan 3-pass padding", n_repeat, [&] {
-        scan(x, y, blockSize, 2*blockSize, scan_conflict_free<blockSize>);
-      });
+    // if (blockSize < 512)
+    //   timeit("scan 3-pass naive", n_repeat, [&] {
+    //       scan(x, y, blockSize, blockSize, scan_naive<blockSize>);
+    //     });
+    // timeit("scan 3-pass padding", n_repeat, [&] {
+    //     scan(x, y, blockSize, 2*blockSize, scan_conflict_free<blockSize>);
+    //   });
     timeit("scan 3-pass swizzling", n_repeat, [&] {
         scan(x, y, blockSize, 2*blockSize, scan_conflict_free_swizzle<blockSize>);
       });
   timeit("scan 3-pass on registers", n_repeat, [&] {
         scan(x, y, blockSize, blockSize, scan_on_registers<blockSize>);
       });
-    timeit("scan 3-pass CUB", n_repeat, [&] {
-        scan(x, y, blockSize, blockSize, scan_cub<blockSize>);
+    // timeit("scan 3-pass CUB", n_repeat, [&] {
+    //     scan(x, y, blockSize, blockSize, scan_cub<blockSize>);
+    //   });
+    timeit("scan 3-pass CUB fancy", n_repeat, [&] {
+        constexpr int itemsPerThread = 4;
+        constexpr int blockSize = 256;
+        scan(x, y, blockSize, itemsPerThread*blockSize, scan_cub_fancy<blockSize, itemsPerThread>);
       });
+    timeit("scan cubbish warp lookback", n_repeat, [&] {
+        // this is 149 us
+        // constexpr int itemsPerThread = 8;
+        // constexpr int blockSize = 128;
+        // this is 142 us
+        constexpr int itemsPerThread = 16;
+        constexpr int blockSize = 64;
+        scan_single_pass(x, y, blockSize, scan_cubbish_warp_lookback<blockSize,itemsPerThread>, itemsPerThread);
+    });
+
     // timeit("scan decoupled lookback", n_repeat, [&] {
     //     scan_single_pass(x, y, blockSize, scan_decoupled_lookback<blockSize>);
     //   });
     timeit("scan 1-pass warp lookback", n_repeat, [&] {
         scan_single_pass(x, y, blockSize, scan_warp_lookback<blockSize>);
       });
-    timeit("scan 1-pass block lookback", n_repeat, [&] {
-        scan_single_pass(x, y, blockSize, scan_block_lookback<blockSize>);
-      });
-    timeit("scan 1-pass block lookback blockload", n_repeat, [&] {
-        scan_single_pass(x, y, blockSize, scan_warp_lookback_blockload<blockSize>);
-      });
+    // timeit("scan 1-pass block lookback", n_repeat, [&] {
+    //     scan_single_pass(x, y, blockSize, scan_block_lookback<blockSize>);
+    //   });
+    // timeit("scan 1-pass block lookback blockload", n_repeat, [&] {
+    //     scan_single_pass(x, y, blockSize, scan_warp_lookback_blockload<blockSize>);
+    //   });
     // do not time memory allocations
     // {
     //   constexpr int blockSize = blockSize;

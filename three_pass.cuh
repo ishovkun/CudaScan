@@ -199,17 +199,16 @@ __global__ void scan_cub_fancy(float* out, float const* in, int n, float* partia
   } temp_storage;
 
   float thread_data[itemsPerThread];
-  BlockLoadT(temp_storage.load).Load(in, thread_data, n);
+  BlockLoadT(temp_storage.load).Load(in + blockIdx.x*blockSize*itemsPerThread, thread_data, n);
   __syncthreads();
 
   float aggregate;
   BlockScanT(temp_storage.scan).InclusiveSum(thread_data, thread_data, aggregate);
   __syncthreads();
 
-  BlockStoreT(temp_storage.store).Store(out, thread_data, n);
+  BlockStoreT(temp_storage.store).Store(out + blockIdx.x*blockSize*itemsPerThread, thread_data, n);
 
   if (threadIdx.x == blockSize-1) {
-    printf("block %d: %f\n", blockIdx.x, aggregate);
     partial_sums[blockIdx.x] = aggregate;
   }
 }

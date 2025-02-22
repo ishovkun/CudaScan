@@ -399,11 +399,10 @@ __global__ void scan_warp_lookback(float* out, float const* in, int n,
   __syncthreads();
 
   // aggregate result
-  float const prefix_sum = sh_prefix_sum;
-  // float prefix_sum;
-  // if (tid & (WARP_SIZE - 1))
-  //   prefix_sum = sh_prefix_sum;
-  // prefix_sum = __shfl_sync(MASK_ALL, sh_prefix_sum, WARP_SIZE - 1);
+  float prefix_sum;
+  if (tid & (WARP_SIZE - 1))
+    prefix_sum = sh_prefix_sum;
+  prefix_sum = __shfl_sync(MASK_ALL, sh_prefix_sum, WARP_SIZE - 1);
 
   auto const aggregate = local_sum + prefix_sum;
 
@@ -414,6 +413,73 @@ __global__ void scan_warp_lookback(float* out, float const* in, int n,
   // write output
   if (i < n) out[i] = aggregate;
 }
+
+template <int blockSize, int itemsPerThread>
+__global__ void scan_cubbish_warp_lookback(float* out, float const* in, int n,
+                                   ScanState* states, uint* tile_counter)
+{
+  __shared__ uint sh_chunk;
+  __shared__ float sh_prefix_sum;
+
+  // select chunk to work on
+  auto tid = threadIdx.x;
+  if (tid == 0) {
+    auto chunk = atomicAdd(tile_counter, 1u);
+    store_status(&states[chunk], ScanState{TileStatus::unavailable, 0.f});
+    sh_chunk = chunk;
+  }
+  __syncthreads();
+
+  using BlockLoadT = cub::BlockLoad<float, blockSize, itemsPerThread, cub::BLOCK_LOAD_WARP_TRANSPOSE>;
+  using BlockStoreT = cub::BlockStore<float, blockSize, itemsPerThread, cub::BLOCK_STORE_WARP_TRANSPOSE>;
+  using BlockScanT = cub::BlockScan<float, blockSize>;
+
+  __shared__ union TempStorage {
+    typename BlockLoadT::TempStorage load;
+    typename BlockStoreT::TempStorage store;
+    typename BlockScanT::TempStorage scan;
+  } temp_storage;
+
+  auto const chunk = sh_chunk;
+  float thread_data[itemsPerThread];
+  BlockLoadT(temp_storage.load).Load(in + chunk*blockSize*itemsPerThread, thread_data, n);
+  __syncthreads();
+
+  float local_sum;
+  BlockScanT(temp_storage.scan).InclusiveSum(thread_data, thread_data, local_sum);
+  __syncthreads();
+
+  // update chunk status to local
+  bool const last_thread_in_block = (tid == blockSize - 1);
+  if (last_thread_in_block) {
+    auto const status = (chunk != 0) ? TileStatus::local_prefix_available :
+                                       TileStatus::global_prefix_available;
+    store_status(&states[chunk], ScanState{status, local_sum});
+  }
+
+  // lookback
+  if (threadIdx.x < WARP_SIZE)
+    warp_lookback(chunk, states, &sh_prefix_sum);
+  __syncthreads();
+
+  // aggregate result
+  float prefix_sum;
+  if (tid & (WARP_SIZE - 1))
+    prefix_sum = sh_prefix_sum;
+  prefix_sum = __shfl_sync(MASK_ALL, sh_prefix_sum, WARP_SIZE - 1);
+
+  // update chunk status
+  if (last_thread_in_block) {
+    store_status(&states[chunk], ScanState{TileStatus::global_prefix_available, prefix_sum + local_sum});
+  }
+
+  for (int i = 0; i < itemsPerThread; i++) {
+    thread_data[i] += prefix_sum;
+  }
+
+  BlockStoreT(temp_storage.store).Store(out + chunk*blockSize*itemsPerThread, thread_data, n);
+}
+
 
 template <int blockSize>
 __global__ void scan_warp_lookback_blockload(float* out, float const* in, int n,
@@ -516,13 +582,15 @@ __global__ void scan_block_lookback(float* out, float const* in, int n,
 void scan_single_pass(thrust::device_vector<float> & in,
                       thrust::device_vector<float> & out,
                       int blockSize,
-                      auto && launch_kernel)
+                      auto && launch_kernel,
+                      int items_per_thread = 1)
 {
   uint32_t* tile_counter;
   cudaMalloc(&tile_counter, sizeof(uint32_t));
   cudaMemset(tile_counter, 0, sizeof(unsigned int));
 
-  int64_t const numBlocks = (in.size() + blockSize - 1) / blockSize;
+  int chunkSize = blockSize * items_per_thread;
+  int64_t const numBlocks = (in.size() + chunkSize - 1) / chunkSize;
 
   // ScanState *states;
   // cudaMalloc(&states, numBlocks*sizeof(ScanState));
