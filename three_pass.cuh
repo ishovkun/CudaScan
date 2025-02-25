@@ -213,6 +213,74 @@ __global__ void scan_cub_fancy(float* out, float const* in, int n, float* partia
   }
 }
 
+template <int blockSize, int itemsPerThread>
+__global__ void scan_fancy(float* out, float const* in, int n, float* partial_sums) {
+  constexpr int chunkSize = blockSize*itemsPerThread;
+  __shared__ float _data[chunkSize];
+  int tid = threadIdx.x;
+  auto lane = threadIdx.x & (WARP_SIZE-1);
+  auto warp = tid / warpSize;
+
+  // load data
+  for (int i = 0; i < itemsPerThread; i++) {
+    int pos_glob = blockIdx.x*chunkSize + i*blockSize + tid;
+    int pos = i*blockSize + tid;
+    _data[pos] = (pos_glob < n) ? in[pos_glob] : 0.f;
+  }
+  __syncthreads();
+
+  // load into thread local
+  float thread_data[itemsPerThread];
+  for (int i = 0; i < itemsPerThread; i++) {
+    auto idx = warp*warpSize*itemsPerThread + lane + i*WARP_SIZE;
+    thread_data[i] = _data[idx];
+  }
+  __syncthreads();
+
+  /*
+    Scan
+   */
+   float total_warp_sum{0};
+   for (int i = 0; i < itemsPerThread; i++) {
+     auto pref_within_warp = warp_scan(thread_data[i]);
+     auto warp_sum = __shfl_sync(MASK_ALL, pref_within_warp, warpSize-1);
+     thread_data[i] = total_warp_sum + pref_within_warp;
+     total_warp_sum += warp_sum;
+   }
+   auto * warp_sums = _data; // don't lose it; reuse it!
+   if (lane == warpSize-1)
+     warp_sums[warp] = total_warp_sum;
+   __syncthreads();
+
+   // scan warp sums in a separate warp
+   if (warp == 0)
+     warp_sums[lane] = warp_scan(warp_sums[lane]);
+   __syncthreads();
+
+   auto prefix = (warp > 0) ? warp_sums[warp-1] : 0.f;
+   __syncthreads();
+
+   // put from local into shared memory
+   for (int i = 0; i < itemsPerThread; i++) {
+    auto idx = warp*WARP_SIZE*itemsPerThread + lane + i*WARP_SIZE;
+    _data[idx] = thread_data[i] + prefix;
+   }
+   __syncthreads();
+
+   // Block Store
+   for (int i = 0; i < itemsPerThread; i++) {
+    int pos_glob = blockIdx.x*chunkSize + i*blockSize + tid;
+    int pos = i*blockSize + tid;
+    if (pos_glob < n) {
+      out[pos_glob] = _data[pos];
+    }
+   }
+   if (tid == 0) {
+     partial_sums[blockIdx.x] = _data[chunkSize-1];
+   }
+}
+
+
 __host__ __device__ constexpr __forceinline__ int conflict_free_offset(int n) {
   return n + (n >> LOG_NUM_BANKS) + (n >> (2*LOG_NUM_BANKS));
 }
@@ -342,9 +410,9 @@ void cub_device_scan(thrust::device_vector<float> & in, thrust::device_vector<fl
 
 void scan(thrust::device_vector<float> & in,
           thrust::device_vector<float> & out,
-          int block_size, int tile_size, auto && scan_kernel) {
+          int block_size, int chunkSize, auto && scan_kernel) {
   auto problem_size = in.size();
-  int num_blocks = (problem_size + tile_size - 1) / tile_size;
+  int num_blocks = (problem_size + chunkSize - 1) / chunkSize;
 
   thrust::device_vector<float> partial_sums(num_blocks, 0);
 
@@ -358,9 +426,9 @@ void scan(thrust::device_vector<float> & in,
   if (num_blocks > 1) {
 
     thrust::device_vector<float> partial_sums_of_partial_sums(num_blocks, 0);
-    scan(partial_sums, partial_sums_of_partial_sums, block_size, tile_size, scan_kernel);
+    scan(partial_sums, partial_sums_of_partial_sums, block_size, chunkSize, scan_kernel);
 
-    add_partial_sums<<<num_blocks, tile_size>>>(thrust::raw_pointer_cast(out.data()),
+    add_partial_sums<<<num_blocks, chunkSize>>>(thrust::raw_pointer_cast(out.data()),
                                                 thrust::raw_pointer_cast(partial_sums_of_partial_sums.data()),
                                                 problem_size);
     gpuErrchk(cudaPeekAtLastError());

@@ -74,7 +74,8 @@ auto main(int argc, char *argv[]) -> int {
 
   if (argc == 1)
   {
-    constexpr int block_size = 256;
+    // constexpr int block_size = 256;
+    constexpr int block_size = 64;
     int n = 5*block_size;
     // constexpr int block_size = 32;
     // int n = 2*block_size;
@@ -84,7 +85,7 @@ auto main(int argc, char *argv[]) -> int {
     thrust::device_vector<float> y_test(n, 0);
     thrust::inclusive_scan(x.begin(), x.end(), y_true.begin());
 
-    // // void scan(in, out, block_size, tile_size,  scan_kernel) ;
+    // // void scan(in, out, block_size, chunkSize,  scan_kernel) ;
     compare("test naive", y_true, y_test, [&] {
         scan(x, y_test, block_size, block_size, scan_naive<block_size>);
     });
@@ -109,6 +110,10 @@ auto main(int argc, char *argv[]) -> int {
     compare("test fancy scan on CUB", y_true, y_test, [&] {
         constexpr int items_per_thread = 2;
         scan(x, y_test, block_size, items_per_thread*block_size, scan_cub_fancy<block_size, items_per_thread>);
+    });
+    compare("test fancy scan", y_true, y_test, [&] {
+        constexpr int items_per_thread = 2;
+        scan(x, y_test, block_size, items_per_thread*block_size, scan_fancy<block_size, items_per_thread>);
     });
     compare("test device CUB", y_true, y_test, [&] {
         cub_device_scan(x, y_test);
@@ -214,7 +219,7 @@ auto main(int argc, char *argv[]) -> int {
     timeit("scan 3-pass swizzling", n_repeat, [&] {
         scan(x, y, blockSize, 2*blockSize, scan_conflict_free_swizzle<blockSize>);
       });
-  timeit("scan 3-pass on registers", n_repeat, [&] {
+    timeit("scan 3-pass on registers", n_repeat, [&] {
         scan(x, y, blockSize, blockSize, scan_on_registers<blockSize>);
       });
     // timeit("scan 3-pass CUB", n_repeat, [&] {
@@ -224,6 +229,11 @@ auto main(int argc, char *argv[]) -> int {
         constexpr int itemsPerThread = 4;
         constexpr int blockSize = 256;
         scan(x, y, blockSize, itemsPerThread*blockSize, scan_cub_fancy<blockSize, itemsPerThread>);
+      });
+    timeit("scan 3-pass fancy", n_repeat, [&] {
+        constexpr int itemsPerThread = 4;
+        constexpr int blockSize = 256;
+        scan(x, y, blockSize, itemsPerThread*blockSize, scan_fancy<blockSize, itemsPerThread>);
       });
     timeit("scan cubbish warp lookback", n_repeat, [&] {
         // this is 149 us
