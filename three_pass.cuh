@@ -237,33 +237,14 @@ __global__ void scan_fancy(float* out, float const* in, int n, float* partial_su
   }
   __syncthreads();
 
-  /*
-    Scan
-   */
-   float total_warp_sum{0};
+  /* Scan */
+   block_scan<blockSize, itemsPerThread>(thread_data, _data);
+   __syncthreads();
+
+   // save thread data to shared data
    for (int i = 0; i < itemsPerThread; i++) {
-     auto pref_within_warp = warp_scan(thread_data[i]);
-     auto warp_sum = __shfl_sync(MASK_ALL, pref_within_warp, warpSize-1);
-     thread_data[i] = total_warp_sum + pref_within_warp;
-     total_warp_sum += warp_sum;
-   }
-   auto * warp_sums = _data; // don't lose it; reuse it!
-   if (lane == warpSize-1)
-     warp_sums[warp] = total_warp_sum;
-   __syncthreads();
-
-   // scan warp sums in a separate warp
-   if (warp == 0)
-     warp_sums[lane] = warp_scan(warp_sums[lane]);
-   __syncthreads();
-
-   auto prefix = (warp > 0) ? warp_sums[warp-1] : 0.f;
-   __syncthreads();
-
-   // put from local into shared memory
-   for (int i = 0; i < itemsPerThread; i++) {
-    auto idx = warp*WARP_SIZE*itemsPerThread + lane + i*WARP_SIZE;
-    _data[idx] = thread_data[i] + prefix;
+     auto idx = warp*warpSize*itemsPerThread + lane + i*WARP_SIZE;
+     _data[idx] = thread_data[i];
    }
    __syncthreads();
 

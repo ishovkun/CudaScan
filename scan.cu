@@ -134,6 +134,10 @@ auto main(int argc, char *argv[]) -> int {
     compare("scan block lookback", y_true, y_test, [&] {
         scan_single_pass(x, y_test, block_size, scan_block_lookback<block_size>);
     });
+    compare("scan fancy lookback", y_true, y_test, [&] {
+        constexpr int itemsPerThread = 2;
+        scan_single_pass(x, y_test, block_size, scan_cubbish_warp_lookback<block_size,itemsPerThread>, itemsPerThread);
+    });
   }
 
   // benchmarks
@@ -250,6 +254,11 @@ auto main(int argc, char *argv[]) -> int {
     //   });
     timeit("scan 1-pass warp lookback", n_repeat, [&] {
         scan_single_pass(x, y, blockSize, scan_warp_lookback<blockSize>);
+      });
+    timeit("scan fancy warp lookback", n_repeat, [&] {
+        constexpr int itemsPerThread = 16;
+        constexpr int blockSize = 64;
+        scan_single_pass(x, y, blockSize, scan_cubbish_warp_lookback<blockSize,itemsPerThread>, itemsPerThread);
       });
     // timeit("scan 1-pass block lookback", n_repeat, [&] {
     //     scan_single_pass(x, y, blockSize, scan_block_lookback<blockSize>);

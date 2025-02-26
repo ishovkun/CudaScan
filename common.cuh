@@ -24,3 +24,30 @@ static __device__ float warp_scan(float value) {
   }
   return value;
 }
+
+template <int blockSize, int itemsPerThread>
+static __device__ void block_scan(float (&thread_data)[itemsPerThread], float *warp_sums) {
+  float total_warp_sum{0};
+  auto warp = threadIdx.x / WARP_SIZE;
+  auto lane = threadIdx.x & (WARP_SIZE - 1);
+  for (int i = 0; i < itemsPerThread; i++) {
+    auto pref_within_warp = warp_scan(thread_data[i]);
+    auto warp_sum = __shfl_sync(MASK_ALL, pref_within_warp, warpSize-1);
+    thread_data[i] = total_warp_sum + pref_within_warp;
+    total_warp_sum += warp_sum;
+  }
+  // write warp sums
+  if (lane == warpSize - 1)
+     warp_sums[warp] = total_warp_sum;
+  __syncthreads();
+
+  // scan warp sums in a separate warp
+  if (warp == 0)
+    warp_sums[lane] = warp_scan(warp_sums[lane]);
+  __syncthreads();
+
+  auto prefix = (warp > 0) ? warp_sums[warp-1] : 0.f;
+  for (int i = 0; i < itemsPerThread; i++) {
+    thread_data[i] += prefix;
+  }
+}
