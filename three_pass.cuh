@@ -7,7 +7,7 @@ __global__ void add_partial_sums(float* out, float* partial_sums, int n) {
 }
 
 template <int blockSize>
-__global__ void scan_naive(float* out, float* in, int n, float* partial_sums) {
+__global__ void scan_double_buffer(float* out, float* in, int n, float* partial_sums) {
   auto tid = threadIdx.x;
   auto i = blockIdx.x * blockDim.x + threadIdx.x;
   __shared__ float sh[blockSize];
@@ -37,7 +37,7 @@ __global__ void scan_naive(float* out, float* in, int n, float* partial_sums) {
 }
 
 template <int blockSize>
-__global__ void scan_more_efficient(float* out, float const* in, int n, float* partial_sums) {
+__global__ void scan_single_buffer(float* out, float const* in, int n, float* partial_sums) {
   auto tid = threadIdx.x;
   auto i = blockIdx.x * blockDim.x + threadIdx.x;
   __shared__ float sh[blockSize];
@@ -87,106 +87,143 @@ __global__ void scan_more_efficient(float* out, float const* in, int n, float* p
   if (i < n) out[i] = sh[tid];
 }
 
-template <int blockSize>
-__global__ void scan_work_efficient(float* out, float const* in, int n, float* partial_sums) {
-  __shared__ float sh[2*blockSize];
+template <int blockSize, int itemsPerThread>
+__global__ void scan_work_efficient(float* out, float const* in,
+                                    int input_size,
+                                    float* partial_sums) {
+  constexpr int chunkSize = blockSize*itemsPerThread;
+  __shared__ float shared[chunkSize];
+  auto const tid = threadIdx.x;
+  auto const chunk = blockIdx.x;
 
-  auto tid = threadIdx.x;
-  auto ia = blockIdx.x * 2* blockSize + threadIdx.x;
-  auto ib = blockIdx.x * 2* blockSize + threadIdx.x + blockSize;
-  if (ia < n) sh[tid] = in[ia];
-  else sh[tid] = 0;
-  if (ib) sh[tid+blockSize] = in[ib];
-  else sh[tid+blockSize] = 0;
+  block_load<blockSize,itemsPerThread>(chunk, in, input_size, shared);
   __syncthreads();
 
   // upsweep
   // the rest is the same as in the previous function, apart from
   // the s limit: in the previous function it was [1, blockSize/2],
   // now it's [1, blockSize]
-  for (int s = 1; s <= blockSize; s *= 2) {
+  for (int s = 1; s <= chunkSize; s *= 2) {
     auto idx = 2*s*tid + s - 1;
     if (idx+s < 2*blockSize) {
-      sh[idx+s] += sh[idx];
+      shared[idx+s] += shared[idx];
     }
     __syncthreads();
   }
   if (tid == 0) {
-    partial_sums[blockIdx.x] = sh[2*blockSize-1];
+    partial_sums[chunk] = shared[2*blockSize-1];
   }
-  // no need to __syncthreads(); (we don't touch the last element)
+
   for (int s = blockSize; s > 0; s /= 2) {
     auto idx = 2*s*(tid+1) - 1;
     if (idx + s < 2*blockSize) {
-      sh[idx+s] += sh[idx];
+      shared[idx+s] += shared[idx];
     }
     __syncthreads();
   }
-  if (ia < n) {
-    out[ia] = sh[tid];
-  }
-  if (ib < n) {
-    out[ib] = sh[tid+blockSize];
-  }
+
+  block_store<blockSize, itemsPerThread>(chunk, out, input_size, shared);
 }
+// template <int blockSize>
+// __global__ void scan_work_efficient(float* out, float const* in, int n, float* partial_sums) {
+//   __shared__ float sh[2*blockSize];
 
-template <int blockSize>
-__global__ void scan_on_registers(float* out, float const* in, int n, float* partial_sums) {
-  // extra element to avoid ifs for thread 0
-  constexpr int shmem_size = 1 + blockSize/WARP_SIZE;
-  __shared__ float warp_sums[shmem_size];
-  // fill shared sums with zero
-  // we should really only set warp_sums[0] = 0
-  auto tid = threadIdx.x;
-  if (tid < shmem_size)
-    warp_sums[tid] = 0.f;
+//   auto tid = threadIdx.x;
+//   auto ia = blockIdx.x * 2* blockSize + threadIdx.x;
+//   auto ib = blockIdx.x * 2* blockSize + threadIdx.x + blockSize;
+//   if (ia < n) sh[tid] = in[ia];
+//   else sh[tid] = 0;
+//   if (ib) sh[tid+blockSize] = in[ib];
+//   else sh[tid+blockSize] = 0;
+//   __syncthreads();
 
-  auto i = blockIdx.x*blockDim.x + threadIdx.x;
-  auto thread_value = (i < n) ? in[i] : 0;
+//   // upsweep
+//   // the rest is the same as in the previous function, apart from
+//   // the s limit: in the previous function it was [1, blockSize/2],
+//   // now it's [1, blockSize]
+//   for (int s = 1; s <= blockSize; s *= 2) {
+//     auto idx = 2*s*tid + s - 1;
+//     if (idx+s < 2*blockSize) {
+//       sh[idx+s] += sh[idx];
+//     }
+//     __syncthreads();
+//   }
+//   if (tid == 0) {
+//     partial_sums[blockIdx.x] = sh[2*blockSize-1];
+//   }
+//   // no need to __syncthreads(); (we don't touch the last element)
+//   for (int s = blockSize; s > 0; s /= 2) {
+//     auto idx = 2*s*(tid+1) - 1;
+//     if (idx + s < 2*blockSize) {
+//       sh[idx+s] += sh[idx];
+//     }
+//     __syncthreads();
+//   }
+//   if (ia < n) {
+//     out[ia] = sh[tid];
+//   }
+//   if (ib < n) {
+//     out[ib] = sh[tid+blockSize];
+//   }
+// }
 
-  auto thread_prefix_within_warp = warp_scan(thread_value);
-  __syncthreads();
+// template <int blockSize>
+// __global__ void scan_on_registers(float* out, float const* in, int n, float* partial_sums) {
+//   // extra element to avoid ifs for thread 0
+//   constexpr int shmem_size = 1 + blockSize/warpSize;
+//   __shared__ float warp_sums[shmem_size];
+//   // fill shared sums with zero
+//   // we should really only set warp_sums[0] = 0
+//   auto tid = threadIdx.x;
+//   if (tid < shmem_size)
+//     warp_sums[tid] = 0.f;
 
-  auto warp = threadIdx.x / WARP_SIZE;
-  auto lane = threadIdx.x & (WARP_SIZE-1);
-  if (lane == WARP_SIZE-1)
-    warp_sums[1+warp] = thread_prefix_within_warp;
-  __syncthreads();
+//   auto i = blockIdx.x*blockDim.x + threadIdx.x;
+//   auto thread_value = (i < n) ? in[i] : 0;
 
-  // scan warp sums in a separate warp
-  // max block size = 1024; 1024/32 = 32 -> should fit inside a warp
-  if (warp == 0)
-    warp_sums[1+lane] = warp_scan(warp_sums[1+lane]);
-  __syncthreads();
+//   auto thread_prefix_within_warp = warp_scan(thread_value);
+//   __syncthreads();
 
-  if (i < n) {
-    out[i] = thread_prefix_within_warp + warp_sums[warp];
-  }
-  if (tid == 0) {
-    partial_sums[blockIdx.x] = warp_sums[shmem_size - 1];
-  }
-}
+//   auto warp = threadIdx.x / warpSize;
+//   auto lane = threadIdx.x & (warpSize-1);
+//   if (lane == warpSize-1)
+//     warp_sums[1+warp] = thread_prefix_within_warp;
+//   __syncthreads();
 
-template <int blockSize>
-__global__ void scan_cub(float* out, float const* in, int n, float* partial_sums) {
+//   // scan warp sums in a separate warp
+//   // max block size = 1024; 1024/32 = 32 -> should fit inside a warp
+//   if (warp == 0)
+//     warp_sums[1+lane] = warp_scan(warp_sums[1+lane]);
+//   __syncthreads();
 
-  using BlockScanT = cub::BlockScan<float, blockSize>;
-  __shared__ typename BlockScanT::TempStorage temp_storage;
+//   if (i < n) {
+//     out[i] = thread_prefix_within_warp + warp_sums[warp];
+//   }
+//   if (tid == 0) {
+//     partial_sums[blockIdx.x] = warp_sums[shmem_size - 1];
+//   }
+// }
 
-  auto i = blockIdx.x*blockDim.x + threadIdx.x;
-  auto thread_value = (i < n) ? in[i] : 0;
+// template <int blockSize>
+// __global__ void scan_cub(float* out, float const* in, int n, float* partial_sums) {
 
-  BlockScanT(temp_storage).InclusiveSum(thread_value, thread_value, partial_sums[blockIdx.x]);
-  if (i < n)
-    out[i] = thread_value;
+//   using BlockScanT = cub::BlockScan<float, blockSize>;
+//   __shared__ typename BlockScanT::TempStorage temp_storage;
 
-  if (threadIdx.x == blockSize-1) {
-    partial_sums[blockIdx.x] = thread_value;
-  }
-}
+//   auto i = blockIdx.x*blockDim.x + threadIdx.x;
+//   auto thread_value = (i < n) ? in[i] : 0;
+
+//   BlockScanT(temp_storage).InclusiveSum(thread_value, thread_value, partial_sums[blockIdx.x]);
+//   if (i < n)
+//     out[i] = thread_value;
+
+//   if (threadIdx.x == blockSize-1) {
+//     partial_sums[blockIdx.x] = thread_value;
+//   }
+// }
 
 template <int blockSize, int itemsPerThread>
-__global__ void scan_cub_fancy(float* out, float const* in, int n, float* partial_sums) {
+__global__ void scan_cub(float* out, float const* in, int n, float* partial_sums) {
 
   using BlockLoadT = cub::BlockLoad<float, blockSize, itemsPerThread, cub::BLOCK_LOAD_WARP_TRANSPOSE>;
   using BlockStoreT = cub::BlockStore<float, blockSize, itemsPerThread, cub::BLOCK_STORE_WARP_TRANSPOSE>;
@@ -214,48 +251,22 @@ __global__ void scan_cub_fancy(float* out, float const* in, int n, float* partia
 }
 
 template <int blockSize, int itemsPerThread>
-__global__ void scan_fancy(float* out, float const* in, int n, float* partial_sums) {
+__global__ void scan_on_registers(float* out, float const* in, int n, float* partial_sums) {
   constexpr int chunkSize = blockSize*itemsPerThread;
   __shared__ float _data[chunkSize];
   int tid = threadIdx.x;
-  auto lane = threadIdx.x & (WARP_SIZE-1);
-  auto warp = tid / warpSize;
+  auto const chunk = blockIdx.x;
 
-  // load data
-  for (int i = 0; i < itemsPerThread; i++) {
-    int pos_glob = blockIdx.x*chunkSize + i*blockSize + tid;
-    int pos = i*blockSize + tid;
-    _data[pos] = (pos_glob < n) ? in[pos_glob] : 0.f;
-  }
-  __syncthreads();
-
-  // load into thread local
   float thread_data[itemsPerThread];
-  for (int i = 0; i < itemsPerThread; i++) {
-    auto idx = warp*warpSize*itemsPerThread + lane + i*WARP_SIZE;
-    thread_data[i] = _data[idx];
-  }
-  __syncthreads();
+  block_load<blockSize, itemsPerThread>(chunk,in, n, thread_data, _data);
+  __syncthreads(); // need to reuse _data
 
   /* Scan */
    block_scan<blockSize, itemsPerThread>(thread_data, _data);
    __syncthreads();
 
-   // save thread data to shared data
-   for (int i = 0; i < itemsPerThread; i++) {
-     auto idx = warp*warpSize*itemsPerThread + lane + i*WARP_SIZE;
-     _data[idx] = thread_data[i];
-   }
-   __syncthreads();
+   block_store<blockSize, itemsPerThread>(chunk, out, n, thread_data, _data);
 
-   // Block Store
-   for (int i = 0; i < itemsPerThread; i++) {
-    int pos_glob = blockIdx.x*chunkSize + i*blockSize + tid;
-    int pos = i*blockSize + tid;
-    if (pos_glob < n) {
-      out[pos_glob] = _data[pos];
-    }
-   }
    if (tid == 0) {
      partial_sums[blockIdx.x] = _data[chunkSize-1];
    }
@@ -266,108 +277,202 @@ __host__ __device__ constexpr __forceinline__ int conflict_free_offset(int n) {
   return n + (n >> LOG_NUM_BANKS) + (n >> (2*LOG_NUM_BANKS));
 }
 
-template <int blockSize>
-__global__ void scan_conflict_free(float* out, float const* in, int n, float* partial_sums) {
-  constexpr int shmem_size =  conflict_free_offset(2*blockSize);
-  __shared__ float sh[shmem_size];
+template <int blockSize, int itemsPerThread>
+__global__ void scan_conflict_free_padding(float* out, float const* in,
+                                           int input_size, float* partial_sums)
+{
+  constexpr int chunkSize = blockSize*itemsPerThread;
+  constexpr int shmem_size =  conflict_free_offset(chunkSize);
+  __shared__ float shared[shmem_size];
   auto tid = threadIdx.x;
-  auto i = blockIdx.x * blockDim.x + threadIdx.x;
+  auto const chunk = blockIdx.x;
 
-  auto a_base = conflict_free_offset(2*tid);
-  auto b_base = conflict_free_offset(2*tid+1);
-
-  if (2*i < n) sh[a_base] = in[2*i];
-  else sh[a_base] = 0;
-  if (2*i+1 < n) sh[b_base] = in[2*i+1];
-  else sh[b_base] = 0;
+  for (int i = 0; i < itemsPerThread; i++) {
+    int global_id = chunk*chunkSize + i*blockSize + tid;
+    int local_id = i*blockSize + tid;
+    shared[conflict_free_offset(local_id)] = (global_id < input_size) ? in[global_id] : 0.f;
+  }
   __syncthreads();
 
   // upsweep
-  for (int s = 1; s <= blockSize; s *= 2) {
+  for (int s = 1; s <= chunkSize; s *= 2) {
     auto idx = 2*s*tid + s - 1;
-    if (idx+s < 2*blockSize) {
-      sh[conflict_free_offset(idx+s)] += sh[conflict_free_offset(idx)];
+    if (idx+s < chunkSize) {
+      shared[conflict_free_offset(idx+s)] += shared[conflict_free_offset(idx)];
     }
     __syncthreads();
   }
 
   if (tid == 0) {
-    partial_sums[blockIdx.x] = sh[conflict_free_offset(2*blockSize-1)];
+    partial_sums[chunk] = shared[conflict_free_offset(chunkSize-1)];
   }
 
   // downsweep
-  for (int s = blockSize; s > 0; s /= 2) {
+  for (int s = chunkSize; s > 0; s /= 2) {
     auto idx = 2*s*(tid+1) - 1;
-    if (idx + s < 2*blockSize) {
-      sh[conflict_free_offset(idx+s)] += sh[conflict_free_offset(idx)];
+    if (idx + s < chunkSize) {
+      shared[conflict_free_offset(idx+s)] += shared[conflict_free_offset(idx)];
     }
     __syncthreads();
   }
-  // write results
-  if (2*i < n) {
-    out[2*i] = sh[a_base];
-  }
-  if (2*i+1 < n) {
-    out[2*i+1] = sh[b_base];
+
+  for (int i = 0; i < itemsPerThread; i++) {
+    int pos_glob = chunk*chunkSize + i*blockSize + tid;
+    int pos = i*blockSize + tid;
+    if (pos_glob < input_size) {
+      out[pos_glob] = shared[conflict_free_offset(pos)];
+    }
   }
 }
+
+// template <int blockSize>
+// __global__ void scan_conflict_free_padding(float* out, float const* in, int n, float* partial_sums) {
+//   constexpr int shmem_size =  conflict_free_offset(2*blockSize);
+//   __shared__ float sh[shmem_size];
+//   auto tid = threadIdx.x;
+//   auto i = blockIdx.x * blockDim.x + threadIdx.x;
+
+//   auto a_base = conflict_free_offset(2*tid);
+//   auto b_base = conflict_free_offset(2*tid+1);
+
+//   if (2*i < n) sh[a_base] = in[2*i];
+//   else sh[a_base] = 0;
+//   if (2*i+1 < n) sh[b_base] = in[2*i+1];
+//   else sh[b_base] = 0;
+//   __syncthreads();
+
+//   // upsweep
+//   for (int s = 1; s <= blockSize; s *= 2) {
+//     auto idx = 2*s*tid + s - 1;
+//     if (idx+s < 2*blockSize) {
+//       sh[conflict_free_offset(idx+s)] += sh[conflict_free_offset(idx)];
+//     }
+//     __syncthreads();
+//   }
+
+//   if (tid == 0) {
+//     partial_sums[blockIdx.x] = sh[conflict_free_offset(2*blockSize-1)];
+//   }
+
+//   // downsweep
+//   for (int s = blockSize; s > 0; s /= 2) {
+//     auto idx = 2*s*(tid+1) - 1;
+//     if (idx + s < 2*blockSize) {
+//       sh[conflict_free_offset(idx+s)] += sh[conflict_free_offset(idx)];
+//     }
+//     __syncthreads();
+//   }
+//   // write results
+//   if (2*i < n) {
+//     out[2*i] = sh[a_base];
+//   }
+//   if (2*i+1 < n) {
+//     out[2*i+1] = sh[b_base];
+//   }
+// }
 
 __device__ constexpr __forceinline__ int swizzle(int i) {
   return i ^ (i >> 5);
 }
 
-template <int blockSize>
-__global__ void scan_conflict_free_swizzle(float* out, float const* in, int n, float* partial_sums) {
-  __shared__ float sh[2*blockSize];
-  auto tid = threadIdx.x;
+template <int blockSize, int itemsPerThread>
+__global__ void scan_conflict_free_swizzle(float* out, float const* in,
+                                           int input_size, float* partial_sums) {
+  constexpr int chunkSize = blockSize*itemsPerThread;
+  __shared__ float shared[chunkSize];
+  auto const tid = threadIdx.x;
+  auto const chunk = blockIdx.x;
 
-  auto a_base = swizzle(tid);
-  auto b_base = swizzle(blockSize + tid);
-  auto a = 2*blockIdx.x*blockDim.x + tid;
-  auto b = 2*blockIdx.x*blockDim.x + blockDim.x + tid;
-  if (a < n) sh[a_base] = in[a];
-  else sh[a_base] = 0;
-  if (b < n) sh[b_base] = in[b];
-  else sh[b_base] = 0;
-
-  // auto i = blockIdx.x * blockDim.x + threadIdx.x;
-  // auto a_base = swizzle(2*tid);
-  // auto b_base = swizzle(2*tid+1);
-  // if (2*i < n) sh[a_base] = in[2*i];
-  // else sh[a_base] = 0;
-  // if (2*i+1 < n) sh[b_base] = in[2*i+1];
-  // else sh[b_base] = 0;
+  for (int i = 0; i < itemsPerThread; i++) {
+    int global_id = chunk*chunkSize + i*blockSize + tid;
+    int local_id = i*blockSize + tid;
+    shared[swizzle(local_id)] = (global_id < input_size) ? in[global_id] : 0.f;
+  }
   __syncthreads();
 
   // upsweep
   for (int s = 1; s <= blockSize; s *= 2) {
     auto idx = 2*s*tid + s - 1;
     if (idx+s < 2*blockSize) {
-      sh[swizzle(idx+s)] += sh[swizzle(idx)];
+      shared[swizzle(idx+s)] += shared[swizzle(idx)];
     }
     __syncthreads();
   }
 
   if (tid == 0) {
-    partial_sums[blockIdx.x] = sh[swizzle(2*blockSize-1)];
+    partial_sums[blockIdx.x] = shared[swizzle(2*blockSize-1)];
   }
 
   // downsweep
   for (int s = blockSize; s > 0; s /= 2) {
     auto idx = 2*s*(tid+1) - 1;
     if (idx + s < 2*blockSize) {
-      sh[swizzle(idx+s)] += sh[swizzle(idx)];
+      shared[swizzle(idx+s)] += shared[swizzle(idx)];
     }
     __syncthreads();
   }
-  // write results
-  if (a < n) {
-    out[a] = sh[a_base];
-  }
-  if (b < n) {
-    out[b] = sh[b_base];
+
+  for (int i = 0; i < itemsPerThread; i++) {
+    int pos_glob = chunk*chunkSize + i*blockSize + tid;
+    int pos = i*blockSize + tid;
+    if (pos_glob < input_size) {
+      out[pos_glob] = shared[swizzle(pos)];
+    }
   }
 }
+
+// template <int blockSize>
+// __global__ void scan_conflict_free_swizzle(float* out, float const* in, int n, float* partial_sums) {
+//   __shared__ float sh[2*blockSize];
+//   auto tid = threadIdx.x;
+
+//   auto a_base = swizzle(tid);
+//   auto b_base = swizzle(blockSize + tid);
+//   auto a = 2*blockIdx.x*blockDim.x + tid;
+//   auto b = 2*blockIdx.x*blockDim.x + blockDim.x + tid;
+//   if (a < n) sh[a_base] = in[a];
+//   else sh[a_base] = 0;
+//   if (b < n) sh[b_base] = in[b];
+//   else sh[b_base] = 0;
+
+//   // auto i = blockIdx.x * blockDim.x + threadIdx.x;
+//   // auto a_base = swizzle(2*tid);
+//   // auto b_base = swizzle(2*tid+1);
+//   // if (2*i < n) sh[a_base] = in[2*i];
+//   // else sh[a_base] = 0;
+//   // if (2*i+1 < n) sh[b_base] = in[2*i+1];
+//   // else sh[b_base] = 0;
+//   __syncthreads();
+
+//   // upsweep
+//   for (int s = 1; s <= blockSize; s *= 2) {
+//     auto idx = 2*s*tid + s - 1;
+//     if (idx+s < 2*blockSize) {
+//       sh[swizzle(idx+s)] += sh[swizzle(idx)];
+//     }
+//     __syncthreads();
+//   }
+
+//   if (tid == 0) {
+//     partial_sums[blockIdx.x] = sh[swizzle(2*blockSize-1)];
+//   }
+
+//   // downsweep
+//   for (int s = blockSize; s > 0; s /= 2) {
+//     auto idx = 2*s*(tid+1) - 1;
+//     if (idx + s < 2*blockSize) {
+//       sh[swizzle(idx+s)] += sh[swizzle(idx)];
+//     }
+//     __syncthreads();
+//   }
+//   // write results
+//   if (a < n) {
+//     out[a] = sh[a_base];
+//   }
+//   if (b < n) {
+//     out[b] = sh[b_base];
+//   }
+// }
 
 void cub_device_scan(thrust::device_vector<float> & in, thrust::device_vector<float> & out)
 {
@@ -389,9 +494,9 @@ void cub_device_scan(thrust::device_vector<float> & in, thrust::device_vector<fl
 }
 
 
-void scan(thrust::device_vector<float> & in,
-          thrust::device_vector<float> & out,
-          int block_size, int chunkSize, auto && scan_kernel) {
+void __noinline__ scan(thrust::device_vector<float> & in,
+                       thrust::device_vector<float> & out,
+                       int block_size, int chunkSize, auto && scan_kernel) {
   auto problem_size = in.size();
   int num_blocks = (problem_size + chunkSize - 1) / chunkSize;
 

@@ -25,7 +25,7 @@ struct ScanState {
 template <int blockSize>
 __device__ float block_scan(int thread_value)
 {
-  constexpr int shmem_size = 1 + blockSize/WARP_SIZE;
+  constexpr int shmem_size = 1 + blockSize/warpSize;
   __shared__ float warp_sums[shmem_size];
 
   auto tid = threadIdx.x;
@@ -35,9 +35,9 @@ __device__ float block_scan(int thread_value)
   auto thread_prefix_within_warp = warp_scan(thread_value);
   __syncthreads();
 
-  auto warp = threadIdx.x / WARP_SIZE;
-  auto lane = threadIdx.x & (WARP_SIZE-1);
-  if (lane == WARP_SIZE-1)
+  auto warp = threadIdx.x / warpSize;
+  auto lane = threadIdx.x & (warpSize-1);
+  if (lane == warpSize-1)
     warp_sums[1+warp] = thread_prefix_within_warp;
   __syncthreads();
   if (warp == 0)
@@ -60,7 +60,8 @@ static __device__ void store_status(ScanState *ptr, ScanState state)
 
   // auto * src = reinterpret_cast<uint64_t*>(&state);
   // auto * dst = reinterpret_cast<uint64_t*>(ptr);
-  // __stcg(dst, *src);
+  // __stcg(dst, *src); // cache only in L2
+  // __stwt(dst, *src); // write through
 }
 
 // template<typename thread_scope = cuda::thread_scope_device>
@@ -70,12 +71,13 @@ static __device__ ScanState load_status(ScanState const *ptr)
   auto const *src = reinterpret_cast<const cuda::atomic<uint64_t, cuda::thread_scope_device>*>(ptr);
   auto dst = reinterpret_cast<uint64_t*>(&state);
   *dst = src->load(cuda::memory_order_relaxed);
-  return state;
 
   // auto const *src = reinterpret_cast<uint64_t const*>(ptr);
   // auto dst = reinterpret_cast<uint64_t*>(&state);
-  // *dst = __ldcv(src);
-  // return state;
+  // *dst = __ldcv(src); // do not cache
+  // *dst = __ldcg(src); // cache in L2, not L1
+
+  return state;
 }
 
 __device__ float serial_lookback(uint32_t chunk, ScanState* states)
@@ -117,7 +119,7 @@ __device__ bool block_any_sync(bool value)
   if (threadIdx.x == 0) sh_chunk = 0;
   __syncthreads();
 
-  auto lane = threadIdx.x & (WARP_SIZE - 1);
+  auto lane = threadIdx.x & (warpSize - 1);
   if (lane == 0)
     atomicAdd_block(&sh_chunk, warp_any);
   __syncthreads();
@@ -127,8 +129,8 @@ __device__ bool block_any_sync(bool value)
 // the correct status is stored in the last lane only!
 __device__ ScanState warp_accumulate_prefix(ScanState thread_state)
 {
-  auto const lane = threadIdx.x & (WARP_SIZE - 1);
-  for (auto s = 1; s < WARP_SIZE; s *= 2) {
+  auto const lane = threadIdx.x & (warpSize - 1);
+  for (auto s = 1; s < warpSize; s *= 2) {
     auto const tmp = shfl_up_sync_status(thread_state, s);
     if (lane >= s) {
       if (tmp.status == TileStatus::unavailable) {
@@ -147,9 +149,9 @@ __device__ ScanState warp_accumulate_prefix(ScanState thread_state)
 __device__ ScanState warp_accumulate_final_prefix_cub(ScanState thread_state)
 {
   // set to zero all but the last lanes with global prefix
-  auto const lane = threadIdx.x & (WARP_SIZE - 1);
+  auto const lane = threadIdx.x & (warpSize - 1);
   const auto final_mask = __ballot_sync(MASK_ALL, thread_state.status == TileStatus::global_prefix_available);
-  const int last_lane_with_global_prefix = WARP_SIZE - 1 - __clz(final_mask);
+  const int last_lane_with_global_prefix = warpSize - 1 - __clz(final_mask);
   thread_state.sum = (lane < last_lane_with_global_prefix) ? 0.f : thread_state.sum;
 
   using WarpReduce = cub::WarpReduce<float>;
@@ -164,28 +166,28 @@ __device__ ScanState warp_accumulate_final_prefix_cub(ScanState thread_state)
 __device__ ScanState warp_accumulate_final_prefix(ScanState thread_state)
 {
   // set to zero all but the last lanes with global prefix
-  auto const lane = threadIdx.x & (WARP_SIZE - 1);
+  auto const lane = threadIdx.x & (warpSize - 1);
   const auto final_mask = __ballot_sync(MASK_ALL, thread_state.status == TileStatus::global_prefix_available);
-  const int last_lane_with_global_prefix = WARP_SIZE - 1 - __clz(final_mask);
+  const int last_lane_with_global_prefix = warpSize - 1 - __clz(final_mask);
   thread_state.sum = (lane < last_lane_with_global_prefix) ? 0.f : thread_state.sum;
 
-  for (auto s = 1; s < WARP_SIZE; s *= 2) {
+  for (auto s = 1; s < warpSize; s *= 2) {
     auto const tmp = __shfl_up_sync(MASK_ALL, thread_state.sum, s);
     if (lane >= s) {
       thread_state.sum += tmp;
     }
   }
-  thread_state.sum = __shfl_sync(MASK_ALL, thread_state.sum, WARP_SIZE - 1);
+  thread_state.sum = __shfl_sync(MASK_ALL, thread_state.sum, warpSize - 1);
   return thread_state;
 }
 
 
-__device__ void warp_lookback(uint32_t chunk, ScanState* states,
-                                   volatile float* sh_prefix_sum)
+__device__ float warp_lookback(uint32_t chunk, ScanState* states,
+                               volatile float* sh_prefix_sum)
 {
   auto const lane = threadIdx.x;
-  int thread_chunk = chunk - (WARP_SIZE - lane);
-  constexpr int last_lane = WARP_SIZE - 1;
+  int thread_chunk = chunk - (warpSize - lane);
+  constexpr int last_lane = warpSize - 1;
 
   ScanState thread_state{TileStatus::global_prefix_available, 0.f};
   float prefix_sum{0.f};
@@ -204,7 +206,7 @@ __device__ void warp_lookback(uint32_t chunk, ScanState* states,
     if (any_finished) break;
 
     // keep looking back
-    thread_chunk -= WARP_SIZE;
+    thread_chunk -= warpSize;
   }
 
   thread_state.sum = prefix_sum;
@@ -214,6 +216,7 @@ __device__ void warp_lookback(uint32_t chunk, ScanState* states,
   if (lane == last_lane) {
     *sh_prefix_sum = thread_state.sum;
   }
+  return thread_state.sum;
 }
 
 template <int blockSize>
@@ -222,9 +225,9 @@ __device__ void warp_lookback_preloaded(uint32_t chunk, ScanState* states,
                                         volatile float* sh_prefix_sum)
 {
   auto const lane = threadIdx.x;
-  int thread_chunk = chunk - (WARP_SIZE - lane);
-  int block_pos = blockSize - (WARP_SIZE - lane);
-  constexpr int last_lane = WARP_SIZE - 1;
+  int thread_chunk = chunk - (warpSize - lane);
+  int block_pos = blockSize - (warpSize - lane);
+  constexpr int last_lane = warpSize - 1;
 
   ScanState thread_state{TileStatus::global_prefix_available, 0.f};
   float prefix_sum{0.f};
@@ -245,8 +248,8 @@ __device__ void warp_lookback_preloaded(uint32_t chunk, ScanState* states,
     if (any_finished) break;
 
     // keep looking back
-    thread_chunk -= WARP_SIZE;
-    block_pos -= WARP_SIZE;
+    thread_chunk -= warpSize;
+    block_pos -= warpSize;
   }
 
   thread_state.sum = prefix_sum;
@@ -262,7 +265,7 @@ __device__ void warp_lookback_preloaded(uint32_t chunk, ScanState* states,
 template<int blockSize>
 __device__ float block_accumulate_prefix(ScanState& thread_state)
 {
-  constexpr int shmem_size = blockSize/WARP_SIZE;
+  constexpr int shmem_size = blockSize/warpSize;
   __shared__ ScanState warp_states[shmem_size];
   __shared__ ScanState _ans;
 
@@ -272,10 +275,10 @@ __device__ float block_accumulate_prefix(ScanState& thread_state)
 
   // local accumulate
   thread_state = warp_accumulate_prefix(thread_state);
-  constexpr int last_lane = WARP_SIZE - 1;
+  constexpr int last_lane = warpSize - 1;
   // thread_state = shfl_sync_status(thread_state, last_lane);
-  auto const warp = tid / WARP_SIZE;
-  auto const lane = tid & (WARP_SIZE - 1);
+  auto const warp = tid / warpSize;
+  auto const lane = tid & (warpSize - 1);
   if (lane == last_lane) {
     warp_states[warp] = thread_state;
   }
@@ -284,7 +287,7 @@ __device__ float block_accumulate_prefix(ScanState& thread_state)
   if (warp == 0) {
     auto warp_state = (lane < shmem_size) ? warp_states[lane] : ScanState{TileStatus::local_prefix_available, 0.f};
     warp_state = warp_accumulate_prefix(warp_state);
-    if (lane == WARP_SIZE - 1) {
+    if (lane == warpSize - 1) {
       _ans = warp_state;
     }
 
@@ -394,15 +397,15 @@ __global__ void scan_warp_lookback(float* out, float const* in, int n,
   }
 
   // lookback
-  if (threadIdx.x < WARP_SIZE)
+  if (threadIdx.x < warpSize)
     warp_lookback(chunk, states, &sh_prefix_sum);
   __syncthreads();
 
   // aggregate result
   float prefix_sum;
-  if (tid & (WARP_SIZE - 1))
+  if (tid & (warpSize - 1))
     prefix_sum = sh_prefix_sum;
-  prefix_sum = __shfl_sync(MASK_ALL, sh_prefix_sum, WARP_SIZE - 1);
+  prefix_sum = __shfl_sync(MASK_ALL, sh_prefix_sum, warpSize - 1);
 
   auto const aggregate = local_sum + prefix_sum;
 
@@ -447,7 +450,7 @@ __global__ void scan_cubbish_warp_lookback(float* out, float const* in, int n,
 
   float local_sum;
   BlockScanT(temp_storage.scan).InclusiveSum(thread_data, thread_data, local_sum);
-  __syncthreads();
+  // __syncthreads(); // no need to sync
 
   // update chunk status to local
   bool const last_thread_in_block = (tid == blockSize - 1);
@@ -458,15 +461,16 @@ __global__ void scan_cubbish_warp_lookback(float* out, float const* in, int n,
   }
 
   // lookback
-  if (threadIdx.x < WARP_SIZE)
+  if (threadIdx.x < warpSize)
     warp_lookback(chunk, states, &sh_prefix_sum);
   __syncthreads();
 
   // aggregate result
-  float prefix_sum;
-  if (tid & (WARP_SIZE - 1))
-    prefix_sum = sh_prefix_sum;
-  prefix_sum = __shfl_sync(MASK_ALL, sh_prefix_sum, WARP_SIZE - 1);
+  // float prefix_sum;
+  // if (tid & (warpSize - 1))
+  //   prefix_sum = sh_prefix_sum;
+  // prefix_sum = __shfl_sync(MASK_ALL, sh_prefix_sum, warpSize - 1);
+  float prefix_sum = sh_prefix_sum;
 
   // update chunk status
   if (last_thread_in_block) {
@@ -521,7 +525,7 @@ __global__ void scan_warp_lookback_blockload(float* out, float const* in, int n,
   __syncthreads();
 
   // lookback
-  if (threadIdx.x < WARP_SIZE)
+  if (threadIdx.x < warpSize)
     warp_lookback_preloaded<blockSize>(chunk, states, _block_state, &sh_prefix_sum);
   __syncthreads();
 
@@ -538,7 +542,7 @@ __global__ void scan_warp_lookback_blockload(float* out, float const* in, int n,
 }
 
 
-template <int blockSize>
+template <int blockSize, int itemsPerThread>
 __global__ void scan_block_lookback(float* out, float const* in, int n,
                                     ScanState* states, uint* tile_counter)
 {
@@ -551,37 +555,84 @@ __global__ void scan_block_lookback(float* out, float const* in, int n,
     sh_chunk = chunk;
   }
   __syncthreads();
-
-  // local prefix sum
   auto const chunk = sh_chunk;
-  auto const i = chunk*blockSize + tid;
-  auto const thread_value = (i < n) ? in[i] : 0.f;
-  auto const local_sum = block_scan<blockSize>(thread_value);
+
+  constexpr int chunkSize = blockSize*itemsPerThread;
+  __shared__ float _data[chunkSize];
+  float thread_data[itemsPerThread];
+  block_load<blockSize, itemsPerThread>(chunk,in, n, thread_data, _data);
+  __syncthreads();
+
+   block_scan<blockSize, itemsPerThread>(thread_data, _data);
 
   // update chunk status to local
   bool const last_thread_in_block = (tid == blockSize - 1);
   if (last_thread_in_block) {
     auto const status = (chunk != 0) ? TileStatus::local_prefix_available :
                                        TileStatus::global_prefix_available;
-    store_status(&states[chunk], ScanState{status, local_sum});
+    store_status(&states[chunk], ScanState{status, thread_data[itemsPerThread-1]});
   }
 
   // lookback
   auto const prefix_sum = block_lookback<blockSize>(chunk, states);
   // aggregate result
-  auto const aggregate = local_sum + prefix_sum;
+  for (int i = 0; i < itemsPerThread; i++) {
+    thread_data[i] += prefix_sum;
+  }
 
   // update chunk status
   if (last_thread_in_block) {
-    store_status(&states[chunk], ScanState{TileStatus::global_prefix_available, aggregate});
+    store_status(&states[chunk], ScanState{TileStatus::global_prefix_available,
+        thread_data[itemsPerThread-1]});
   }
-  // write output
-  if (i < n) out[i] = aggregate;
+
+  block_store<blockSize, itemsPerThread>(chunk, out, n, thread_data, _data);
 }
+// template <int blockSize>
+// __global__ void scan_block_lookback(float* out, float const* in, int n,
+//                                     ScanState* states, uint* tile_counter)
+// {
+//   auto tid = threadIdx.x;
+//   // select chunk to work on
+//   __shared__ uint sh_chunk;
+//   if (tid == 0) {
+//     auto chunk = atomicAdd(tile_counter, 1u);
+//     store_status(&states[chunk], ScanState{TileStatus::unavailable, 0.f});
+//     sh_chunk = chunk;
+//   }
+//   __syncthreads();
+
+//   // local prefix sum
+//   auto const chunk = sh_chunk;
+//   auto const i = chunk*blockSize + tid;
+//   auto const thread_value = (i < n) ? in[i] : 0.f;
+//   auto const local_sum = block_scan<blockSize>(thread_value);
+
+//   // update chunk status to local
+//   bool const last_thread_in_block = (tid == blockSize - 1);
+//   if (last_thread_in_block) {
+//     auto const status = (chunk != 0) ? TileStatus::local_prefix_available :
+//                                        TileStatus::global_prefix_available;
+//     store_status(&states[chunk], ScanState{status, local_sum});
+//   }
+
+//   // lookback
+//   auto const prefix_sum = block_lookback<blockSize>(chunk, states);
+//   // aggregate result
+//   auto const aggregate = local_sum + prefix_sum;
+
+//   // update chunk status
+//   if (last_thread_in_block) {
+//     store_status(&states[chunk], ScanState{TileStatus::global_prefix_available, aggregate});
+//   }
+//   // write output
+//   if (i < n) out[i] = aggregate;
+// }
 
 template <int blockSize, int itemsPerThread>
-__global__ void fancy_scan_lookback(float* out, float const* in, int n,
-                                    ScanState* states, uint* tile_counter)
+__global__ void fancy_scan_lookback(float* __restrict__ out,
+                                    float const* __restrict__ in, int n,
+                                    ScanState* __restrict__ states, uint* tile_counter)
 {
   constexpr int chunkSize = blockSize*itemsPerThread;
   __shared__ float _data[chunkSize];
@@ -598,28 +649,31 @@ __global__ void fancy_scan_lookback(float* out, float const* in, int n,
   __syncthreads();
   auto const chunk = sh_chunk;
 
-  auto lane = threadIdx.x & (WARP_SIZE-1);
-  auto warp = tid / warpSize;
+  // auto lane = threadIdx.x & (warpSize-1);
+  // auto warp = tid / warpSize;
 
-  // load data
-  for (int i = 0; i < itemsPerThread; i++) {
-    int pos_glob = chunk*chunkSize + i*blockSize + tid;
-    int pos = i*blockSize + tid;
-    _data[pos] = (pos_glob < n) ? in[pos_glob] : 0.f;
-  }
-  __syncthreads();
+  // // load data
+  // for (int i = 0; i < itemsPerThread; i++) {
+  //   int pos_glob = chunk*chunkSize + i*blockSize + tid;
+  //   int pos = i*blockSize + tid;
+  //   _data[pos] = (pos_glob < n) ? in[pos_glob] : 0.f;
+  // }
+  // __syncthreads();
 
-  // load into thread local
+  // // load into thread local
+  // float thread_data[itemsPerThread];
+  // for (int i = 0; i < itemsPerThread; i++) {
+  //   auto idx = warp*warpSize*itemsPerThread + lane + i*warpSize;
+  //   thread_data[i] = _data[idx];
+  // }
+
   float thread_data[itemsPerThread];
-  for (int i = 0; i < itemsPerThread; i++) {
-    auto idx = warp*warpSize*itemsPerThread + lane + i*WARP_SIZE;
-    thread_data[i] = _data[idx];
-  }
+  block_load<blockSize, itemsPerThread>(chunk, in, n, thread_data, _data);
   __syncthreads();
 
   /* Scan */
    block_scan<blockSize, itemsPerThread>(thread_data, _data);
-   __syncthreads();
+   // __syncthreads(); // no need to sync here
 
   // update chunk status to local
   bool const last_thread_in_block = (tid == blockSize - 1);
@@ -631,47 +685,28 @@ __global__ void fancy_scan_lookback(float* out, float const* in, int n,
     store_status(&states[chunk], ScanState{status, local_sum});
   }
 
-  if (threadIdx.x < WARP_SIZE)
+  if (threadIdx.x < warpSize) {
     warp_lookback(chunk, states, &sh_prefix_sum);
+  }
   __syncthreads();
 
   // aggregate result
-  float prefix_sum;
-  if (tid & (WARP_SIZE - 1))
-    prefix_sum = sh_prefix_sum;
-  prefix_sum = __shfl_sync(MASK_ALL, sh_prefix_sum, WARP_SIZE - 1);
-
-  // update chunk status
-  if (last_thread_in_block) {
-    store_status(&states[chunk], ScanState{TileStatus::global_prefix_available, prefix_sum + local_sum});
-  }
-
+  float prefix_sum = sh_prefix_sum;
   for (int i = 0; i < itemsPerThread; i++) {
     thread_data[i] += prefix_sum;
   }
-
-  // save thread data to shared data
-  for (int i = 0; i < itemsPerThread; i++) {
-    auto idx = warp*warpSize*itemsPerThread + lane + i*WARP_SIZE;
-    _data[idx] = thread_data[i];
+  if (last_thread_in_block) {
+    store_status(&states[chunk], ScanState{TileStatus::global_prefix_available, thread_data[itemsPerThread-1]});
   }
-  __syncthreads();
 
-  // Block Store
-  for (int i = 0; i < itemsPerThread; i++) {
-    int pos_glob = blockIdx.x*chunkSize + i*blockSize + tid;
-    int pos = i*blockSize + tid;
-    if (pos_glob < n) {
-      out[pos_glob] = _data[pos];
-    }
-  }
+  block_store<blockSize, itemsPerThread>(chunk, out, n, thread_data, _data);
 }
 
-void scan_single_pass(thrust::device_vector<float> & in,
-                      thrust::device_vector<float> & out,
-                      int blockSize,
-                      auto && launch_kernel,
-                      int items_per_thread = 1)
+void __noinline__ scan_single_pass(thrust::device_vector<float> & in,
+                                   thrust::device_vector<float> & out,
+                                   int blockSize,
+                                   auto && launch_kernel,
+                                   int items_per_thread = 1)
 {
   uint32_t* tile_counter;
   cudaMalloc(&tile_counter, sizeof(uint32_t));
@@ -680,14 +715,15 @@ void scan_single_pass(thrust::device_vector<float> & in,
   int chunkSize = blockSize * items_per_thread;
   int64_t const numBlocks = (in.size() + chunkSize - 1) / chunkSize;
 
-  // ScanState *states;
-  // cudaMalloc(&states, numBlocks*sizeof(ScanState));
-  thrust::device_vector<ScanState> states_vector(numBlocks);
-  auto* states = states_vector.data().get();
+  ScanState *states;
+  cudaMalloc(&states, numBlocks*sizeof(ScanState));
+
+  // thrust::device_vector<ScanState> states_vector(numBlocks);
+  // auto* states = states_vector.data().get();
 
   launch_kernel<<<numBlocks, blockSize>>>
       (out.data().get(), in.data().get(), in.size(), states, tile_counter);
 
-  // cudaFree(states);
+  cudaFree(states);
   cudaFree(tile_counter);
 }
