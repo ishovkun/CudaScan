@@ -69,14 +69,6 @@ template <int blockSize, int itemsPerThread>
 __device__ void block_load(int chunk, float const *in, size_t input_size,
                            float (&thread_data)[itemsPerThread],
                            float * shared) {
-  // // load into shared memory
-  // constexpr int chunkSize = blockSize*itemsPerThread;
-  // int const tid = threadIdx.x;
-
-  // for (int i = 0; i < itemsPerThread; i++) {
-  //   int idx = chunk*chunkSize + i*blockSize + tid;
-  //   shared[i*blockSize + tid] = (idx < input_size) ? in[idx] : 0.f;
-  // }
   block_load<blockSize,itemsPerThread>(chunk, in, input_size, shared);
   __syncthreads();
 
@@ -108,7 +100,6 @@ template <int blockSize, int itemsPerThread>
 __device__ void block_store(int chunk, float *out, size_t input_size,
                             float (&thread_data)[itemsPerThread],
                             float * shared) {
-  // constexpr int chunkSize = blockSize*itemsPerThread;
   int const tid = threadIdx.x;
   auto const warp = tid / warpSize;
   auto lane = threadIdx.x & (warpSize-1);
@@ -119,11 +110,4 @@ __device__ void block_store(int chunk, float *out, size_t input_size,
   __syncthreads();
 
   block_store<blockSize, itemsPerThread>(chunk, out, input_size, shared);
-  // for (int i = 0; i < itemsPerThread; i++) {
-  //   int pos_glob = chunk*chunkSize + i*blockSize + tid;
-  //   int pos = i*blockSize + tid;
-  //   if (pos_glob < input_size) {
-  //     out[pos_glob] = shared[pos];
-  //   }
-  // }
 }
