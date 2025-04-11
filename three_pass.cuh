@@ -1,8 +1,43 @@
+// __global__ void add_partial_sums(float* out, float* partial_sums, int n) {
+//   auto blockOffset = blockIdx.x * blockDim.x;
+//   auto tid = threadIdx.x;
+//   if (blockIdx.x > 0 && blockOffset + tid < n) {
+//     out[blockOffset + tid] += partial_sums[blockIdx.x - 1];
+//   }
+// }
 __global__ void add_partial_sums(float* out, float* partial_sums, int n) {
   auto blockOffset = blockIdx.x * blockDim.x;
   auto tid = threadIdx.x;
-  if (blockIdx.x > 0 && blockOffset + tid < n) {
-    out[blockOffset + tid] += partial_sums[blockIdx.x - 1];
+  __shared__ float partial_sum;
+  if (tid == 0) {
+    partial_sum = (blockIdx.x > 0) ? partial_sums[blockIdx.x - 1] : 0.f;
+  }
+  __syncthreads();
+  if (blockOffset + tid < n) {
+    out[blockOffset + tid] += partial_sum;
+  }
+}
+
+template <int chunksPerBlock>
+__global__ void addPartialSums(float* out, float* chunkPrefixes, int chunkSize, int n) {
+  auto tid = threadIdx.x;
+  auto firstChunk = blockIdx.x*chunksPerBlock;
+  auto numChunks = n / chunkSize;
+  __shared__ float cache[chunksPerBlock];
+
+  for (int i = 0; blockDim.x*i + tid < chunksPerBlock; i++) {
+    auto chunk = blockIdx.x*chunksPerBlock + blockDim.x*i + tid - 1;
+    auto chunkLocal = blockDim.x*i + tid;
+    if (chunkLocal < chunksPerBlock)
+      cache[chunkLocal] = (chunk < numChunks) ? chunkPrefixes[chunk] : 0.f;
+  }
+  __syncthreads();
+
+  for (int idx = blockIdx.x*chunksPerBlock*chunkSize + tid; idx < (blockIdx.x+1)*chunksPerBlock*chunkSize; idx += blockDim.x) {
+    auto chunkLocal = idx / chunkSize - firstChunk;
+    if (idx < n) {
+      out[idx] += cache[chunkLocal];
+    }
   }
 }
 
@@ -10,9 +45,9 @@ template <int blockSize>
 __global__ void scan_double_buffer(float* out, float* in, int n, float* partial_sums) {
   auto tid = threadIdx.x;
   auto i = blockIdx.x * blockDim.x + threadIdx.x;
-  __shared__ float sh[blockSize];
-  if (i < n) sh[tid] = in[i];
-  else       sh[tid] = 0.f;
+  __shared__ float shared[2][blockSize];
+  if (i < n) shared[0][tid] = in[i];
+  else       shared[0][tid] = 0.f;
   __syncthreads();
 
   // Double buffering, the table prints whatever in the output buffer
@@ -21,19 +56,15 @@ __global__ void scan_double_buffer(float* out, float* in, int n, float* partial_
   // | s=1  | x0 | x0,x1  | x1,x2   | x2,x3  | x3,x4  | x4, x5 | x5,x6  | x6,x7  | x7,x8  | x8,x9   | x9,x10   | x10,x11 | x11,x12 | x12,x13 | x14      | x14,x15  |
   // | s=2  | x0 | x0..x1 | x0...x2 | x0..x3 | x1..x4 | x2..x5 | x3..x6 | x4..x7 | x5..x8 | x6...x9 | x7...x10 | x7..x11 | x8..x12 | x9..x13 | x10..x14 | x11..x15 |
   // | s=3  | x0 | x0..x1 | x0...x2 | x0..x3 | x0..x4 | x0..x5 | x0..x6 | x0..x7 | x1..x8 | x2...x9 | x3...x10 | x4..x11 | x5..x12 | x6..x13 | x7..x14  | x8..x15  |
-  int fin = 0; // flag, !fin = out
+  int rbuf = 0; // read buffer idx
   for (int s = 1; s < blockSize; s *= 2) {
-    if (tid >= s) {
-      sh[(!fin)*blockSize + tid] = sh[fin*blockSize + tid - s] + sh[fin*blockSize + tid];
-    } else {
-      sh[(!fin) * blockSize + tid] = sh[fin * blockSize + tid];
-    }
-
-    fin = !fin;
+    float add = (tid >= s) ? shared[rbuf][tid-s] : 0.f;
+    shared[!rbuf][tid] = shared[rbuf][tid] + add;
+    rbuf = !rbuf;
     __syncthreads();
   }
-  out[i] = sh[(fin)*blockSize + tid];
-  if (tid == 0) partial_sums[blockIdx.x] = sh[fin*blockSize + blockSize-1];
+  out[i] = shared[rbuf][tid];
+  if (tid == 0) partial_sums[blockIdx.x] = shared[rbuf][blockSize-1];
 }
 
 template <int blockSize>
@@ -105,24 +136,23 @@ __global__ void scan_work_efficient(float* out, float const* in,
   // now it's [1, blockSize]
   for (int s = 1; s <= chunkSize; s *= 2) {
     auto idx = 2*s*tid + s - 1;
-    if (idx+s < 2*blockSize) {
+    if (idx+s < chunkSize) {
       shared[idx+s] += shared[idx];
     }
     __syncthreads();
   }
-  if (tid == 0) {
-    partial_sums[chunk] = shared[2*blockSize-1];
-  }
-
-  for (int s = blockSize; s > 0; s /= 2) {
+  for (int s = chunkSize; s > 0; s /= 2) {
     auto idx = 2*s*(tid+1) - 1;
-    if (idx + s < 2*blockSize) {
+    if (idx + s < chunkSize) {
       shared[idx+s] += shared[idx];
     }
     __syncthreads();
   }
 
   block_store<blockSize, itemsPerThread>(chunk, out, input_size, shared);
+  if (tid == 0) {
+    partial_sums[chunk] = shared[chunkSize-1];
+  }
 }
 // template <int blockSize>
 // __global__ void scan_work_efficient(float* out, float const* in, int n, float* partial_sums) {
@@ -514,9 +544,18 @@ void __noinline__ scan(thrust::device_vector<float> & in,
     thrust::device_vector<float> partial_sums_of_partial_sums(num_blocks, 0);
     scan(partial_sums, partial_sums_of_partial_sums, block_size, chunkSize, scan_kernel);
 
-    add_partial_sums<<<num_blocks, chunkSize>>>(thrust::raw_pointer_cast(out.data()),
-                                                thrust::raw_pointer_cast(partial_sums_of_partial_sums.data()),
-                                                problem_size);
+    // we make a separate grid for accumulating partial sums
+    {
+      constexpr int chunksPerBlock = 64;
+      auto nBlocksAddSums = (num_blocks + chunksPerBlock - 1) / chunksPerBlock;
+      addPartialSums<chunksPerBlock><<<nBlocksAddSums, chunksPerBlock>>>(
+          out.data().get(), partial_sums_of_partial_sums.data().get(),
+          chunkSize, problem_size);
+    }
+
+    // add_partial_sums<<<num_blocks, chunkSize>>>(thrust::raw_pointer_cast(out.data()),
+    //                                             thrust::raw_pointer_cast(partial_sums_of_partial_sums.data()),
+    //                                             problem_size);
     gpuErrchk(cudaPeekAtLastError());
     gpuErrchk(cudaDeviceSynchronize());
   }
