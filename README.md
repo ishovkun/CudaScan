@@ -27,3 +27,14 @@ The experiment is conducted on a A100 GPU.
 | Block Lookback        | 1                | 380.802   |
 | Warp Lookback         | 1                | 277.896   |
 | Thrust                | 1                | 269.444   |
+
+# Inclusive Scan
+``` c++
+void inclusive_scan(float const *in, float *out, size_t input_size) {
+  out[0] = in[0];
+  for (size_t i = 1; i < input_size; i++)
+    out[i] = out[i-1] + in[i];
+}
+```
+
+`
